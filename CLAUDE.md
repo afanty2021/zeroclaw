@@ -138,7 +138,7 @@ Required:
 - `src/agent/` — orchestration loop
 - `src/gateway/` — webhook/gateway server
 - `src/security/` — policy, pairing, secret store
-- `src/memory/` — markdown/sqlite memory backends + embeddings/vector merge
+- `src/memory/` — markdown/sqlite/postgres memory backends + embeddings/vector merge
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)

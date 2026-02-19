@@ -138,7 +138,7 @@ ZeroClaw 是一个以 Rust 为核心的自主代理运行时，针对以下目�
 - `src/agent/` — 编排循环
 - `src/gateway/` — webhook/网关服务器
 - `src/security/` — 策略、配对、密钥存储
-- `src/memory/` — markdown/sqlite 内存后端 + 嵌入/向量合并
+- `src/memory/` — markdown/sqlite/postgres 内存后端 + 嵌入/向量合并
 - `src/providers/` — 模型提供商和弹性包装器
 - `src/channels/` — Telegram/Discord/Slack 等渠道
 - `src/tools/` — 工具执行表面（shell、文件、内存、浏览器）

@@ -7,5 +7,6 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #4648 | 1:11 PM | 🔵 | Provider architecture includes 13 Rust modules for AI service integrations | ~307 |
+| #4683 | 1:20 PM | 🔵 | docs/CLAUDE.md file exists but is empty or minimal | ~223 |
+| #4663 | 1:13 PM | 🔵 | Provider documentation details MiniMax and Kimi-code configuration with OAuth support | ~362 |
 </claude-mem-context>

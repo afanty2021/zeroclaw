@@ -7,5 +7,5 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
-| #4648 | 1:11 PM | 🔵 | Provider architecture includes 13 Rust modules for AI service integrations | ~307 |
+| #4637 | 10:52 AM | 🔵 | AGENTS.md and CLAUDE.md referenced in three source files | ~250 |
 </claude-mem-context>
