@@ -1,6 +1,8 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::DelegateAgentConfig;
 use crate::providers::{self, Provider};
+use crate::security::policy::ToolOperation;
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
@@ -16,8 +18,9 @@ const DELEGATE_TIMEOUT_SECS: u64 = 120;
 /// summarization) to purpose-built sub-agents.
 pub struct DelegateTool {
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
-    /// Global API key fallback (from config.api_key)
-    fallback_api_key: Option<String>,
+    security: Arc<SecurityPolicy>,
+    /// Global credential fallback (from config.api_key)
+    fallback_credential: Option<String>,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
 }
@@ -25,11 +28,13 @@ pub struct DelegateTool {
 impl DelegateTool {
     pub fn new(
         agents: HashMap<String, DelegateAgentConfig>,
-        fallback_api_key: Option<String>,
+        fallback_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
-            fallback_api_key,
+            security,
+            fallback_credential,
             depth: 0,
         }
     }
@@ -39,12 +44,14 @@ impl DelegateTool {
     /// their DelegateTool via this method with `depth: parent.depth + 1`.
     pub fn with_depth(
         agents: HashMap<String, DelegateAgentConfig>,
-        fallback_api_key: Option<String>,
+        fallback_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
         depth: u32,
     ) -> Self {
         Self {
             agents: Arc::new(agents),
-            fallback_api_key,
+            security,
+            fallback_credential,
             depth,
         }
     }
@@ -164,14 +171,27 @@ impl Tool for DelegateTool {
             });
         }
 
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "delegate")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
         // Create provider for this agent
-        let api_key = agent_config
+        let provider_credential_owned = agent_config
             .api_key
-            .as_deref()
-            .or(self.fallback_api_key.as_deref());
+            .clone()
+            .or_else(|| self.fallback_credential.clone());
+        #[allow(clippy::option_as_ref_deref)]
+        let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> =
-            match providers::create_provider(&agent_config.provider, api_key) {
+            match providers::create_provider(&agent_config.provider, provider_credential) {
                 Ok(p) => p,
                 Err(e) => {
                     return Ok(ToolResult {
@@ -248,6 +268,11 @@ impl Tool for DelegateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     fn sample_agents() -> HashMap<String, DelegateAgentConfig> {
         let mut agents = HashMap::new();
@@ -268,7 +293,7 @@ mod tests {
                 provider: "openrouter".to_string(),
                 model: "anthropic/claude-sonnet-4-20250514".to_string(),
                 system_prompt: None,
-                api_key: Some("sk-test".to_string()),
+                api_key: Some("delegate-test-credential".to_string()),
                 temperature: None,
                 max_depth: 2,
             },
@@ -278,7 +303,7 @@ mod tests {
 
     #[test]
     fn name_and_schema() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         assert_eq!(tool.name(), "delegate");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["agent"].is_object());
@@ -294,13 +319,13 @@ mod tests {
 
     #[test]
     fn description_not_empty() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn schema_lists_agent_names() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["agent"]["description"]
             .as_str()
@@ -310,21 +335,21 @@ mod tests {
 
     #[tokio::test]
     async fn missing_agent_param() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool.execute(json!({"prompt": "test"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn missing_prompt_param() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool.execute(json!({"agent": "researcher"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn unknown_agent_returns_error() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool
             .execute(json!({"agent": "nonexistent", "prompt": "test"}))
             .await
@@ -335,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn depth_limit_enforced() {
-        let tool = DelegateTool::with_depth(sample_agents(), None, 3);
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 3);
         let result = tool
             .execute(json!({"agent": "researcher", "prompt": "test"}))
             .await
@@ -347,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn depth_limit_per_agent() {
         // coder has max_depth=2, so depth=2 should be blocked
-        let tool = DelegateTool::with_depth(sample_agents(), None, 2);
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 2);
         let result = tool
             .execute(json!({"agent": "coder", "prompt": "test"}))
             .await
@@ -358,7 +383,7 @@ mod tests {
 
     #[test]
     fn empty_agents_schema() {
-        let tool = DelegateTool::new(HashMap::new(), None);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security());
         let schema = tool.parameters_schema();
         let desc = schema["properties"]["agent"]["description"]
             .as_str()
@@ -380,7 +405,7 @@ mod tests {
                 max_depth: 3,
             },
         );
-        let tool = DelegateTool::new(agents, None);
+        let tool = DelegateTool::new(agents, None, test_security());
         let result = tool
             .execute(json!({"agent": "broken", "prompt": "test"}))
             .await
@@ -391,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn blank_agent_rejected() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool
             .execute(json!({"agent": "  ", "prompt": "test"}))
             .await
@@ -402,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn blank_prompt_rejected() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool
             .execute(json!({"agent": "researcher", "prompt": "  \t  "}))
             .await
@@ -413,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn whitespace_agent_name_trimmed_and_found() {
-        let tool = DelegateTool::new(sample_agents(), None);
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
         // " researcher " with surrounding whitespace — after trim becomes "researcher"
         let result = tool
             .execute(json!({"agent": " researcher ", "prompt": "test"}))
@@ -429,5 +454,124 @@ mod tests {
                     .unwrap_or("")
                     .contains("Unknown agent")
         );
+    }
+
+    #[tokio::test]
+    async fn delegation_blocked_in_readonly_mode() {
+        let readonly = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(sample_agents(), None, readonly);
+        let result = tool
+            .execute(json!({"agent": "researcher", "prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("read-only mode"));
+    }
+
+    #[tokio::test]
+    async fn delegation_blocked_when_rate_limited() {
+        let limited = Arc::new(SecurityPolicy {
+            max_actions_per_hour: 0,
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(sample_agents(), None, limited);
+        let result = tool
+            .execute(json!({"agent": "researcher", "prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn delegate_context_is_prepended_to_prompt() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "tester".to_string(),
+            DelegateAgentConfig {
+                provider: "invalid-for-test".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let tool = DelegateTool::new(agents, None, test_security());
+        let result = tool
+            .execute(json!({
+                "agent": "tester",
+                "prompt": "do something",
+                "context": "some context data"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Failed to create provider"));
+    }
+
+    #[tokio::test]
+    async fn delegate_empty_context_omits_prefix() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "tester".to_string(),
+            DelegateAgentConfig {
+                provider: "invalid-for-test".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let tool = DelegateTool::new(agents, None, test_security());
+        let result = tool
+            .execute(json!({
+                "agent": "tester",
+                "prompt": "do something",
+                "context": ""
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Failed to create provider"));
+    }
+
+    #[test]
+    fn delegate_depth_construction() {
+        let tool = DelegateTool::with_depth(sample_agents(), None, test_security(), 5);
+        assert_eq!(tool.depth, 5);
+    }
+
+    #[tokio::test]
+    async fn delegate_no_agents_configured() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+        let result = tool
+            .execute(json!({"agent": "any", "prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("none configured"));
     }
 }

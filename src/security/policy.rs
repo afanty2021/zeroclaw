@@ -24,6 +24,13 @@ pub enum CommandRiskLevel {
     High,
 }
 
+/// Classifies whether a tool operation is read-only or side-effecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOperation {
+    Read,
+    Act,
+}
+
 /// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
@@ -343,6 +350,7 @@ impl SecurityPolicy {
     ///   validates each sub-command against the allowlist
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
+    /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
@@ -350,12 +358,26 @@ impl SecurityPolicy {
 
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
-        if command.contains('`') || command.contains("$(") || command.contains("${") {
+        if command.contains('`')
+            || command.contains("$(")
+            || command.contains("${")
+            || command.contains("<(")
+            || command.contains(">(")
+        {
             return false;
         }
 
         // Block output redirections — they can write to arbitrary paths
         if command.contains('>') {
+            return false;
+        }
+
+        // Block `tee` — it can write to arbitrary files, bypassing the
+        // redirect check above (e.g. `echo secret | tee /etc/crontab`)
+        if command
+            .split_whitespace()
+            .any(|w| w == "tee" || w.ends_with("/tee"))
+        {
             return false;
         }
 
@@ -384,13 +406,9 @@ impl SecurityPolicy {
             // Strip leading env var assignments (e.g. FOO=bar cmd)
             let cmd_part = skip_env_assignments(segment);
 
-            let base_cmd = cmd_part
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .rsplit('/')
-                .next()
-                .unwrap_or("");
+            let mut words = cmd_part.split_whitespace();
+            let base_raw = words.next().unwrap_or("");
+            let base_cmd = base_raw.rsplit('/').next().unwrap_or("");
 
             if base_cmd.is_empty() {
                 continue;
@@ -403,6 +421,12 @@ impl SecurityPolicy {
             {
                 return false;
             }
+
+            // Validate arguments for the command
+            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            if !self.is_args_safe(base_cmd, &args) {
+                return false;
+            }
         }
 
         // At least one command must be present
@@ -412,6 +436,29 @@ impl SecurityPolicy {
         });
 
         has_cmd
+    }
+
+    /// Check for dangerous arguments that allow sub-command execution.
+    fn is_args_safe(&self, base: &str, args: &[String]) -> bool {
+        let base = base.to_ascii_lowercase();
+        match base.as_str() {
+            "find" => {
+                // find -exec and find -ok allow arbitrary command execution
+                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+            }
+            "git" => {
+                // git config, alias, and -c can be used to set dangerous options
+                // (e.g. git config core.editor "rm -rf /")
+                !args.iter().any(|arg| {
+                    arg == "config"
+                        || arg.starts_with("config.")
+                        || arg == "alias"
+                        || arg.starts_with("alias.")
+                        || arg == "-c"
+                })
+            }
+            _ => true,
+        }
     }
 
     /// Check if a file path is allowed (no path traversal, within workspace)
@@ -488,6 +535,33 @@ impl SecurityPolicy {
     /// Check if autonomy level permits any action at all
     pub fn can_act(&self) -> bool {
         self.autonomy != AutonomyLevel::ReadOnly
+    }
+
+    /// Enforce policy for a tool operation.
+    ///
+    /// Read operations are always allowed by autonomy/rate gates.
+    /// Act operations require non-readonly autonomy and available action budget.
+    pub fn enforce_tool_operation(
+        &self,
+        operation: ToolOperation,
+        operation_name: &str,
+    ) -> Result<(), String> {
+        match operation {
+            ToolOperation::Read => Ok(()),
+            ToolOperation::Act => {
+                if !self.can_act() {
+                    return Err(format!(
+                        "Security policy: read-only mode, cannot perform '{operation_name}'"
+                    ));
+                }
+
+                if !self.record_action() {
+                    return Err("Rate limit exceeded: action budget exhausted".to_string());
+                }
+
+                Ok(())
+            }
+        }
     }
 
     /// Record an action and check if the rate limit has been exceeded.
@@ -574,6 +648,35 @@ mod tests {
     #[test]
     fn can_act_full_true() {
         assert!(full_policy().can_act());
+    }
+
+    #[test]
+    fn enforce_tool_operation_read_allowed_in_readonly_mode() {
+        let p = readonly_policy();
+        assert!(p
+            .enforce_tool_operation(ToolOperation::Read, "memory_recall")
+            .is_ok());
+    }
+
+    #[test]
+    fn enforce_tool_operation_act_blocked_in_readonly_mode() {
+        let p = readonly_policy();
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap_err();
+        assert!(err.contains("read-only mode"));
+    }
+
+    #[test]
+    fn enforce_tool_operation_act_uses_rate_budget() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 0,
+            ..default_policy()
+        };
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap_err();
+        assert!(err.contains("Rate limit exceeded"));
     }
 
     // ── is_command_allowed ───────────────────────────────────
@@ -809,6 +912,7 @@ mod tests {
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
+            ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
@@ -983,9 +1087,40 @@ mod tests {
     }
 
     #[test]
+    fn command_argument_injection_blocked() {
+        let p = default_policy();
+        // find -exec is a common bypass
+        assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
+        assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
+        // git config/alias can execute commands
+        assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
+        assert!(!p.is_command_allowed("git alias.st status"));
+        assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        // Legitimate commands should still work
+        assert!(p.is_command_allowed("find . -name '*.txt'"));
+        assert!(p.is_command_allowed("git status"));
+        assert!(p.is_command_allowed("git add ."));
+    }
+
+    #[test]
     fn command_injection_dollar_brace_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo ${IFS}cat${IFS}/etc/passwd"));
+    }
+
+    #[test]
+    fn command_injection_tee_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo secret | tee /etc/crontab"));
+        assert!(!p.is_command_allowed("ls | /usr/bin/tee outfile"));
+        assert!(!p.is_command_allowed("tee file.txt"));
+    }
+
+    #[test]
+    fn command_injection_process_substitution_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("cat <(echo pwned)"));
+        assert!(!p.is_command_allowed("ls >(cat /etc/passwd)"));
     }
 
     #[test]
@@ -1130,6 +1265,7 @@ mod tests {
             max_cost_per_day_cents: 100,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
@@ -1251,5 +1387,113 @@ mod tests {
                 "Default forbidden_paths must include {dot}"
             );
         }
+    }
+
+    // ── §1.2 Path resolution / symlink bypass tests ──────────
+
+    #[test]
+    fn resolved_path_blocks_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_resolved_path");
+        let _ = std::fs::create_dir_all(&workspace);
+
+        // Use the canonicalized workspace so starts_with checks match
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let policy = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        // A resolved path inside the workspace should be allowed
+        let inside = canonical_workspace.join("subdir").join("file.txt");
+        assert!(
+            policy.is_resolved_path_allowed(&inside),
+            "path inside workspace should be allowed"
+        );
+
+        // A resolved path outside the workspace should be blocked
+        let canonical_temp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let outside = canonical_temp.join("outside_workspace_zeroclaw");
+        assert!(
+            !policy.is_resolved_path_allowed(&outside),
+            "path outside workspace must be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn resolved_path_blocks_root_escape() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/home/zeroclaw_user/project"),
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            "resolved path to /etc/passwd must be blocked"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/root/.bashrc")),
+            "resolved path to /root/.bashrc must be blocked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_path_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_symlink_escape");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside_target");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Create a symlink inside workspace pointing outside
+        let link_path = workspace.join("escape_link");
+        symlink(&outside, &link_path).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+
+        // The resolved symlink target should be outside workspace
+        let resolved = link_path.canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_allowed(&resolved),
+            "symlink-resolved path outside workspace must be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_path_allowed_blocks_null_bytes() {
+        let policy = default_policy();
+        assert!(
+            !policy.is_path_allowed("file\0.txt"),
+            "paths with null bytes must be blocked"
+        );
+    }
+
+    #[test]
+    fn is_path_allowed_blocks_url_encoded_traversal() {
+        let policy = default_policy();
+        assert!(
+            !policy.is_path_allowed("..%2fetc%2fpasswd"),
+            "URL-encoded path traversal must be blocked"
+        );
+        assert!(
+            !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
+            "URL-encoded parent dir traversal must be blocked"
+        );
     }
 }

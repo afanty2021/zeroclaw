@@ -7,11 +7,14 @@
 // The Composio API key is stored in the encrypted secret store.
 
 use super::traits::{Tool, ToolResult};
+use crate::security::policy::ToolOperation;
+use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 
 const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api/v2";
 const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
@@ -20,20 +23,24 @@ const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
 pub struct ComposioTool {
     api_key: String,
     default_entity_id: String,
-    client: Client,
+    security: Arc<SecurityPolicy>,
 }
 
 impl ComposioTool {
-    pub fn new(api_key: &str, default_entity_id: Option<&str>) -> Self {
+    pub fn new(
+        api_key: &str,
+        default_entity_id: Option<&str>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
         Self {
             api_key: api_key.to_string(),
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            security,
         }
+    }
+
+    fn client(&self) -> Client {
+        crate::config::build_runtime_proxy_client_with_timeouts("tool.composio", 60, 10)
     }
 
     /// List available Composio apps/actions for the authenticated user.
@@ -59,7 +66,7 @@ impl ComposioTool {
 
     async fn list_actions_v3(&self, app_name: Option<&str>) -> anyhow::Result<Vec<ComposioAction>> {
         let url = format!("{COMPOSIO_API_BASE_V3}/tools");
-        let mut req = self.client.get(&url).header("x-api-key", &self.api_key);
+        let mut req = self.client().get(&url).header("x-api-key", &self.api_key);
 
         req = req.query(&[("limit", "200")]);
         if let Some(app) = app_name.map(str::trim).filter(|app| !app.is_empty()) {
@@ -86,7 +93,7 @@ impl ComposioTool {
         }
 
         let resp = self
-            .client
+            .client()
             .get(&url)
             .header("x-api-key", &self.api_key)
             .send()
@@ -112,12 +119,12 @@ impl ComposioTool {
         action_name: &str,
         params: serde_json::Value,
         entity_id: Option<&str>,
-        connected_account_id: Option<&str>,
+        connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         let tool_slug = normalize_tool_slug(action_name);
 
         match self
-            .execute_action_v3(&tool_slug, params.clone(), entity_id, connected_account_id)
+            .execute_action_v3(&tool_slug, params.clone(), entity_id, connected_account_ref)
             .await
         {
             Ok(result) => Ok(result),
@@ -130,21 +137,17 @@ impl ComposioTool {
         }
     }
 
-    async fn execute_action_v3(
-        &self,
+    fn build_execute_action_v3_request(
         tool_slug: &str,
         params: serde_json::Value,
         entity_id: Option<&str>,
-        connected_account_id: Option<&str>,
-    ) -> anyhow::Result<serde_json::Value> {
-        let url = if let Some(connected_account_id) = connected_account_id
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute/{connected_account_id}")
-        } else {
-            format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute")
-        };
+        connected_account_ref: Option<&str>,
+    ) -> (String, serde_json::Value) {
+        let url = format!("{COMPOSIO_API_BASE_V3}/tools/{tool_slug}/execute");
+        let account_ref = connected_account_ref.and_then(|candidate| {
+            let trimmed_candidate = candidate.trim();
+            (!trimmed_candidate.is_empty()).then_some(trimmed_candidate)
+        });
 
         let mut body = json!({
             "arguments": params,
@@ -153,9 +156,29 @@ impl ComposioTool {
         if let Some(entity) = entity_id {
             body["user_id"] = json!(entity);
         }
+        if let Some(account_ref) = account_ref {
+            body["connected_account_id"] = json!(account_ref);
+        }
+
+        (url, body)
+    }
+
+    async fn execute_action_v3(
+        &self,
+        tool_slug: &str,
+        params: serde_json::Value,
+        entity_id: Option<&str>,
+        connected_account_ref: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let (url, body) = Self::build_execute_action_v3_request(
+            tool_slug,
+            params,
+            entity_id,
+            connected_account_ref,
+        );
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -191,7 +214,7 @@ impl ComposioTool {
         }
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -263,7 +286,7 @@ impl ComposioTool {
         });
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -296,7 +319,7 @@ impl ComposioTool {
         });
 
         let resp = self
-            .client
+            .client()
             .post(&url)
             .header("x-api-key", &self.api_key)
             .json(&body)
@@ -320,7 +343,7 @@ impl ComposioTool {
         let url = format!("{COMPOSIO_API_BASE_V3}/auth_configs");
 
         let resp = self
-            .client
+            .client()
             .get(&url)
             .header("x-api-key", &self.api_key)
             .query(&[
@@ -465,6 +488,17 @@ impl Tool for ComposioTool {
             }
 
             "execute" => {
+                if let Err(error) = self
+                    .security
+                    .enforce_tool_operation(ToolOperation::Act, "composio.execute")
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+
                 let action_name = args
                     .get("tool_slug")
                     .or_else(|| args.get("action_name"))
@@ -474,11 +508,11 @@ impl Tool for ComposioTool {
                     })?;
 
                 let params = args.get("params").cloned().unwrap_or(json!({}));
-                let connected_account_id =
+                let connected_account_ref =
                     args.get("connected_account_id").and_then(|v| v.as_str());
 
                 match self
-                    .execute_action(action_name, params, Some(entity_id), connected_account_id)
+                    .execute_action(action_name, params, Some(entity_id), connected_account_ref)
                     .await
                 {
                     Ok(result) => {
@@ -499,6 +533,17 @@ impl Tool for ComposioTool {
             }
 
             "connect" => {
+                if let Err(error) = self
+                    .security
+                    .enforce_tool_operation(ToolOperation::Act, "composio.connect")
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+
                 let app = args.get("app").and_then(|v| v.as_str());
                 let auth_config_id = args.get("auth_config_id").and_then(|v| v.as_str());
 
@@ -594,9 +639,38 @@ async fn response_error(resp: reqwest::Response) -> String {
     }
 
     if let Some(api_error) = extract_api_error_message(&body) {
-        format!("HTTP {}: {api_error}", status.as_u16())
+        return format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            sanitize_error_message(&api_error)
+        );
+    }
+
+    format!("HTTP {}", status.as_u16())
+}
+
+fn sanitize_error_message(message: &str) -> String {
+    let mut sanitized = message.replace('\n', " ");
+    for marker in [
+        "connected_account_id",
+        "connectedAccountId",
+        "entity_id",
+        "entityId",
+        "user_id",
+        "userId",
+    ] {
+        sanitized = sanitized.replace(marker, "[redacted]");
+    }
+
+    let max_chars = 240;
+    if sanitized.chars().count() <= max_chars {
+        sanitized
     } else {
-        format!("HTTP {}: {body}", status.as_u16())
+        let mut end = max_chars;
+        while end > 0 && !sanitized.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &sanitized[..end])
     }
 }
 
@@ -689,25 +763,30 @@ pub struct ComposioAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     // ── Constructor ───────────────────────────────────────────
 
     #[test]
     fn composio_tool_has_correct_name() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         assert_eq!(tool.name(), "composio");
     }
 
     #[test]
     fn composio_tool_has_description() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("1000+"));
     }
 
     #[test]
     fn composio_tool_schema_has_required_fields() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
         assert!(schema["properties"]["action_name"].is_object());
@@ -722,7 +801,7 @@ mod tests {
 
     #[test]
     fn composio_tool_spec_roundtrip() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let spec = tool.spec();
         assert_eq!(spec.name, "composio");
         assert!(spec.parameters.is_object());
@@ -732,14 +811,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_missing_action_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn execute_unknown_action_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "unknown"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("Unknown action"));
@@ -747,16 +826,60 @@ mod tests {
 
     #[tokio::test]
     async fn execute_without_action_name_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "execute"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn connect_without_target_returns_error() {
-        let tool = ComposioTool::new("test-key", None);
+        let tool = ComposioTool::new("test-key", None, test_security());
         let result = tool.execute(json!({"action": "connect"})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_in_readonly_mode() {
+        let readonly = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = ComposioTool::new("test-key", None, readonly);
+        let result = tool
+            .execute(json!({
+                "action": "execute",
+                "action_name": "GITHUB_LIST_REPOS"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("read-only mode"));
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_when_rate_limited() {
+        let limited = Arc::new(SecurityPolicy {
+            max_actions_per_hour: 0,
+            ..SecurityPolicy::default()
+        });
+        let tool = ComposioTool::new("test-key", None, limited);
+        let result = tool
+            .execute(json!({
+                "action": "execute",
+                "action_name": "GITHUB_LIST_REPOS"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Rate limit exceeded"));
     }
 
     // ── API response parsing ──────────────────────────────────
@@ -947,5 +1070,41 @@ mod tests {
     #[test]
     fn composio_api_base_url_is_v3() {
         assert_eq!(COMPOSIO_API_BASE_V3, "https://backend.composio.dev/api/v3");
+    }
+
+    #[test]
+    fn build_execute_action_v3_request_uses_fixed_endpoint_and_body_account_id() {
+        let (url, body) = ComposioTool::build_execute_action_v3_request(
+            "gmail-send-email",
+            json!({"to": "test@example.com"}),
+            Some("workspace-user"),
+            Some("account-42"),
+        );
+
+        assert_eq!(
+            url,
+            "https://backend.composio.dev/api/v3/tools/gmail-send-email/execute"
+        );
+        assert_eq!(body["arguments"]["to"], json!("test@example.com"));
+        assert_eq!(body["user_id"], json!("workspace-user"));
+        assert_eq!(body["connected_account_id"], json!("account-42"));
+    }
+
+    #[test]
+    fn build_execute_action_v3_request_drops_blank_optional_fields() {
+        let (url, body) = ComposioTool::build_execute_action_v3_request(
+            "github-list-repos",
+            json!({}),
+            None,
+            Some("   "),
+        );
+
+        assert_eq!(
+            url,
+            "https://backend.composio.dev/api/v3/tools/github-list-repos/execute"
+        );
+        assert_eq!(body["arguments"], json!({}));
+        assert!(body.get("connected_account_id").is_none());
+        assert!(body.get("user_id").is_none());
     }
 }

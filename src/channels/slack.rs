@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 
 /// Slack channel — polls conversations.history via Web API
@@ -6,7 +6,6 @@ pub struct SlackChannel {
     bot_token: String,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
-    client: reqwest::Client,
 }
 
 impl SlackChannel {
@@ -15,8 +14,11 @@ impl SlackChannel {
             bot_token,
             channel_id,
             allowed_users,
-            client: reqwest::Client::new(),
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("channel.slack")
     }
 
     /// Check if a Slack user ID is in the allowlist.
@@ -29,7 +31,7 @@ impl SlackChannel {
     /// Get the bot's own user ID so we can ignore our own messages
     async fn get_bot_user_id(&self) -> Option<String> {
         let resp: serde_json::Value = self
-            .client
+            .http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
@@ -51,14 +53,14 @@ impl Channel for SlackChannel {
         "slack"
     }
 
-    async fn send(&self, message: &str, channel: &str) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let body = serde_json::json!({
-            "channel": channel,
-            "text": message
+            "channel": message.recipient,
+            "text": message.content
         });
 
         let resp = self
-            .client
+            .http_client()
             .post("https://slack.com/api/chat.postMessage")
             .bearer_auth(&self.bot_token)
             .json(&body)
@@ -108,7 +110,7 @@ impl Channel for SlackChannel {
             }
 
             let resp = match self
-                .client
+                .http_client()
                 .get("https://slack.com/api/conversations.history")
                 .bearer_auth(&self.bot_token)
                 .query(&params)
@@ -161,6 +163,7 @@ impl Channel for SlackChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{channel_id}_{ts}"),
                         sender: user.to_string(),
+                        reply_target: channel_id.clone(),
                         content: text.to_string(),
                         channel: "slack".to_string(),
                         timestamp: std::time::SystemTime::now()
@@ -178,7 +181,7 @@ impl Channel for SlackChannel {
     }
 
     async fn health_check(&self) -> bool {
-        self.client
+        self.http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()

@@ -79,6 +79,94 @@ git push --no-verify
 
 > **Note:** CI runs the same checks, so skipped hooks will be caught on the PR.
 
+## Local Secret Management (Required)
+
+ZeroClaw supports layered secret management for local development and CI hygiene.
+
+### Secret Storage Options
+
+1. **Environment variables** (recommended for local development)
+    - Copy `.env.example` to `.env` and fill in values
+    - `.env` files are Git-ignored and should stay local
+    - Best for temporary/local API keys
+
+2. **Config file** (`~/.zeroclaw/config.toml`)
+    - Persistent setup for long-term use
+    - When `secrets.encrypt = true` (default), secret values are encrypted before save
+    - Secret key is stored at `~/.zeroclaw/.secret_key` with restricted permissions
+    - Use `zeroclaw onboard` for guided setup
+
+### Runtime Resolution Rules
+
+API key resolution follows this order:
+
+1. Explicit key passed from config/CLI
+2. Provider-specific env vars (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...)
+3. Generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`)
+
+Provider/model config overrides:
+
+- `ZEROCLAW_PROVIDER` / `PROVIDER`
+- `ZEROCLAW_MODEL`
+
+See `.env.example` for practical examples and currently supported provider key env vars.
+
+### Pre-Commit Secret Hygiene (Mandatory)
+
+Before every commit, verify:
+
+- [ ] No `.env` files are staged (`.env.example` only)
+- [ ] No raw API keys/tokens in code, tests, fixtures, examples, logs, or commit messages
+- [ ] No credentials in debug output or error payloads
+- [ ] `git diff --cached` has no accidental secret-like strings
+
+Quick local audit:
+
+```bash
+# Search staged diff for common secret markers
+git diff --cached | grep -iE '(api[_-]?key|secret|token|password|bearer|sk-)'
+
+# Confirm no .env file is staged
+git status --short | grep -E '\.env$'
+```
+
+### Optional Local Secret Scanning
+
+For extra guardrails, install one of:
+
+- **gitleaks**: [GitHub - gitleaks/gitleaks](https://github.com/gitleaks/gitleaks)
+- **truffleHog**: [GitHub - trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog)
+- **git-secrets**: [GitHub - awslabs/git-secrets](https://github.com/awslabs/git-secrets)
+
+This repo includes `.githooks/pre-commit` to run `gitleaks protect --staged --redact` when gitleaks is installed.
+
+Enable hooks with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+If gitleaks is not installed, the pre-commit hook prints a warning and continues.
+
+### What Must Never Be Committed
+
+- `.env` files (use `.env.example` only)
+- API keys, tokens, passwords, or credentials (plain or encrypted)
+- OAuth tokens or session identifiers
+- Webhook signing secrets
+- `~/.zeroclaw/.secret_key` or similar key files
+- Personal identifiers or real user data in tests/fixtures
+
+### If a Secret Is Committed Accidentally
+
+1. Revoke/rotate the credential immediately
+2. Do not rely only on `git revert` (history still contains the secret)
+3. Purge history with `git filter-repo` or BFG
+4. Force-push cleaned history (coordinate with maintainers)
+5. Ensure the leaked value is removed from PR/issue/discussion/comment history
+
+Reference: [GitHub guide: removing sensitive data from a repository](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
+
 ## Collaboration Tracks (Risk-Based)
 
 To keep review throughput high without lowering quality, every PR should map to one track:
@@ -100,15 +188,21 @@ To keep docs useful under high PR volume, we use these rules:
 - **Risk-proportionate detail**: high-risk paths need deeper evidence; low-risk paths stay lightweight.
 - **Side-effect visibility**: document blast radius, failure modes, and rollback before merge.
 - **Automation assists, humans decide**: bots triage and label, but merge accountability stays human.
+- **Index-first discoverability**: `docs/README.md` is the first entry point for operational documentation.
+- **Template-first authoring**: start new operational docs from `docs/doc-template.md`.
 
 ### Documentation System Map
 
 | Doc | Primary purpose | When to update |
 |---|---|---|
+| `docs/README.md` | canonical docs index and taxonomy | add/remove docs or change documentation ownership/navigation |
+| `docs/doc-template.md` | standard skeleton for new operational documentation | when required sections or documentation quality bar changes |
 | `CONTRIBUTING.md` | contributor contract and readiness baseline | contributor expectations or policy changes |
 | `docs/pr-workflow.md` | governance logic and merge contract | workflow/risk/merge gate changes |
 | `docs/reviewer-playbook.md` | reviewer operating checklist | review depth or triage behavior changes |
 | `docs/ci-map.md` | CI ownership and triage entry points | workflow trigger/job ownership changes |
+| `docs/network-deployment.md` | runtime deployment and network operating guide | gateway/channel/tunnel/network runtime behavior changes |
+| `docs/proxy-agent-playbook.md` | agent-operable proxy runbook and rollback recipes | proxy scope/selector/tooling behavior changes |
 
 ## PR Definition of Ready (DoR)
 
@@ -121,6 +215,8 @@ Before requesting review, ensure all of the following are true:
 - No personal/sensitive data is introduced in code/docs/tests/fixtures/logs/examples/commit messages.
 - Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
 - If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
+- If docs were changed, update `docs/README.md` navigation and reciprocal links with related docs.
+- If a new operational doc was added, start from `docs/doc-template.md` and keep risk/rollback/troubleshooting sections where applicable.
 - Linked issue (or rationale for no issue) is included.
 
 ## PR Definition of Done (DoD)
@@ -132,6 +228,7 @@ A PR is merge-ready when:
 - Risk level matches changed paths (`risk: low/medium/high`).
 - User-visible behavior, migration, and rollback notes are complete.
 - Follow-up TODOs are explicit and tracked in issues.
+- For documentation changes, links and ownership mapping in `CONTRIBUTING.md` and `docs/README.md` are consistent.
 
 ## High-Volume Collaboration Rules
 
