@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -75,18 +75,32 @@ struct NativeMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct NativeToolSpec {
     #[serde(rename = "type")]
     kind: String,
     function: NativeToolFunctionSpec,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct NativeToolFunctionSpec {
     name: String,
     description: String,
     parameters: serde_json::Value,
+}
+
+fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
+    let spec: NativeToolSpec = serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("Invalid OpenAI tool specification: {e}"))?;
+
+    if spec.kind != "function" {
+        anyhow::bail!(
+            "Invalid OpenAI tool specification: unsupported tool type '{}', expected 'function'",
+            spec.kind
+        );
+    }
+
+    Ok(spec)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,6 +121,16 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,7 +270,11 @@ impl OpenAiProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse { text, tool_calls }
+        ProviderChatResponse {
+            text,
+            tool_calls,
+            usage: None,
+        }
     }
 
     fn http_client(&self) -> Client {
@@ -341,17 +369,82 @@ impl Provider for OpenAiProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
             .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        Ok(Self::parse_native_response(message))
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
     }
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
+        })?;
+
+        let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
+            None
+        } else {
+            Some(
+                tools
+                    .iter()
+                    .cloned()
+                    .map(parse_native_tool_spec)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(messages),
+            temperature,
+            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tools: native_tools,
+        };
+
+        let response = self
+            .http_client()
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {credential}"))
+            .json(&native_request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI", response).await);
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -536,5 +629,94 @@ mod tests {
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(msg.effective_content(), Some("Real answer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_fails_without_key() {
+        let p = OpenAiProvider::new(None);
+        let messages = vec![ChatMessage::user("hello".to_string())];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+        let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("API key not set"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_rejects_invalid_tool_shape() {
+        let p = OpenAiProvider::new(Some("openai-test-credential"));
+        let messages = vec![ChatMessage::user("hello".to_string())];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+
+        let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid OpenAI tool specification"));
+    }
+
+    #[test]
+    fn native_tool_spec_deserializes_from_openai_format() {
+        let json = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        });
+        let spec = parse_native_tool_spec(json).unwrap();
+        assert_eq!(spec.kind, "function");
+        assert_eq!(spec.function.name, "shell");
+    }
+
+    #[test]
+    fn native_response_parses_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.completion_tokens, Some(50));
+    }
+
+    #[test]
+    fn native_response_parses_without_usage() {
+        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
     }
 }

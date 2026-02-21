@@ -1,8 +1,11 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
+use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
+use crate::providers::{
+    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -13,6 +16,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -21,6 +25,10 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Minimum user-message length (in chars) for auto-save to memory.
+/// Matches the channel-side constant in `channels/mod.rs`.
+const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -223,9 +231,16 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
+                if memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            context.push('\n');
+            if context == "[Memory context]\n" {
+                context.clear();
+            } else {
+                context.push('\n');
+            }
         }
     }
 
@@ -295,7 +310,11 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
             .trim()
             .to_string();
         if !name.is_empty() {
-            let arguments = parse_arguments_value(function.get("arguments"));
+            let arguments = parse_arguments_value(
+                function
+                    .get("arguments")
+                    .or_else(|| function.get("parameters")),
+            );
             return Some(ParsedToolCall { name, arguments });
         }
     }
@@ -311,7 +330,8 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments = parse_arguments_value(value.get("arguments"));
+    let arguments =
+        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
     Some(ParsedToolCall { name, arguments })
 }
 
@@ -346,7 +366,120 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 4] = ["<tool_call>", "<toolcall>", "<tool-call>", "<invoke>"];
+fn is_xml_meta_tag(tag: &str) -> bool {
+    let normalized = tag.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "tool_call"
+            | "toolcall"
+            | "tool-call"
+            | "invoke"
+            | "thinking"
+            | "thought"
+            | "analysis"
+            | "reasoning"
+            | "reflection"
+    )
+}
+
+/// Match opening XML tags: `<tag_name>`.  Does NOT use backreferences.
+static XML_OPEN_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
+
+/// Extracts all `<tag>…</tag>` pairs from `input`, returning `(tag_name, inner_content)`.
+/// Handles matching closing tags without regex backreferences.
+fn extract_xml_pairs(input: &str) -> Vec<(&str, &str)> {
+    let mut results = Vec::new();
+    let mut search_start = 0;
+    while let Some(open_cap) = XML_OPEN_TAG_RE.captures(&input[search_start..]) {
+        let full_open = open_cap.get(0).unwrap();
+        let tag_name = open_cap.get(1).unwrap().as_str();
+        let open_end = search_start + full_open.end();
+
+        let closing_tag = format!("</{tag_name}>");
+        if let Some(close_pos) = input[open_end..].find(&closing_tag) {
+            let inner = &input[open_end..open_end + close_pos];
+            results.push((tag_name, inner.trim()));
+            search_start = open_end + close_pos + closing_tag.len();
+        } else {
+            search_start = open_end;
+        }
+    }
+    results
+}
+
+/// Parse XML-style tool calls in `<tool_call>` bodies.
+/// Supports both nested argument tags and JSON argument payloads:
+/// - `<memory_recall><query>...</query></memory_recall>`
+/// - `<shell>{"command":"pwd"}</shell>`
+fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
+    let mut calls = Vec::new();
+    let trimmed = xml_content.trim();
+
+    if !trimmed.starts_with('<') || !trimmed.contains('>') {
+        return None;
+    }
+
+    for (tool_name_str, inner_content) in extract_xml_pairs(trimmed) {
+        let tool_name = tool_name_str.to_string();
+        if is_xml_meta_tag(&tool_name) {
+            continue;
+        }
+
+        if inner_content.is_empty() {
+            continue;
+        }
+
+        let mut args = serde_json::Map::new();
+
+        if let Some(first_json) = extract_json_values(inner_content).into_iter().next() {
+            match first_json {
+                serde_json::Value::Object(object_args) => {
+                    args = object_args;
+                }
+                other => {
+                    args.insert("value".to_string(), other);
+                }
+            }
+        } else {
+            for (key_str, value) in extract_xml_pairs(inner_content) {
+                let key = key_str.to_string();
+                if is_xml_meta_tag(&key) {
+                    continue;
+                }
+                if !value.is_empty() {
+                    args.insert(key, serde_json::Value::String(value.to_string()));
+                }
+            }
+
+            if args.is_empty() {
+                args.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(inner_content.to_string()),
+                );
+            }
+        }
+
+        calls.push(ParsedToolCall {
+            name: tool_name,
+            arguments: serde_json::Value::Object(args),
+        });
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+const TOOL_CALL_OPEN_TAGS: [&str; 5] = [
+    "<tool_call>",
+    "<toolcall>",
+    "<tool-call>",
+    "<invoke>",
+    "<minimax:toolcall>",
+];
 
 fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
@@ -360,6 +493,7 @@ fn matching_tool_call_close_tag(open_tag: &str) -> Option<&'static str> {
         "<toolcall>" => Some("</toolcall>"),
         "<tool-call>" => Some("</tool-call>"),
         "<invoke>" => Some("</invoke>"),
+        "<minimax:toolcall>" => Some("</minimax:toolcall>"),
         _ => None,
     }
 }
@@ -483,15 +617,206 @@ fn find_json_end(input: &str) -> Option<usize> {
     None
 }
 
+/// Parse XML attribute-style tool calls from response text.
+/// This handles MiniMax and similar providers that output:
+/// ```xml
+/// <minimax:toolcall>
+/// <invoke name="shell">
+/// <parameter name="command">ls</parameter>
+/// </invoke>
+/// </minimax:toolcall>
+/// ```
+fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
+    let mut calls = Vec::new();
+
+    // Regex to find <invoke name="toolname">...</invoke> blocks
+    static INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?s)<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>"#).unwrap()
+    });
+
+    // Regex to find <parameter name="paramname">value</parameter>
+    static PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<parameter\s+name="([^"]+)"[^>]*>([^<]*)</parameter>"#).unwrap()
+    });
+
+    for cap in INVOKE_RE.captures_iter(response) {
+        let tool_name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let inner = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+
+        if tool_name.is_empty() {
+            continue;
+        }
+
+        let mut arguments = serde_json::Map::new();
+
+        for param_cap in PARAM_RE.captures_iter(inner) {
+            let param_name = param_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let param_value = param_cap.get(2).map(|m| m.as_str()).unwrap_or("");
+
+            if !param_name.is_empty() {
+                arguments.insert(
+                    param_name.to_string(),
+                    serde_json::Value::String(param_value.to_string()),
+                );
+            }
+        }
+
+        if !arguments.is_empty() {
+            calls.push(ParsedToolCall {
+                name: map_tool_name_alias(tool_name).to_string(),
+                arguments: serde_json::Value::Object(arguments),
+            });
+        }
+    }
+
+    calls
+}
+
+/// Parse Perl/hash-ref style tool calls from response text.
+/// This handles formats like:
+/// ```
+/// TOOL_CALL
+/// {tool => "shell", args => {
+///   --command "ls -la"
+///   --description "List current directory contents"
+/// }}
+/// /TOOL_CALL
+/// ```
+fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
+    let mut calls = Vec::new();
+
+    // Regex to find TOOL_CALL blocks - handle double closing braces }}
+    static PERL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)TOOL_CALL\s*\{(.+?)\}\}\s*/TOOL_CALL").unwrap());
+
+    // Regex to find tool => "name" in the content
+    static TOOL_NAME_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"tool\s*=>\s*"([^"]+)""#).unwrap());
+
+    // Regex to find args => { ... } block
+    static ARGS_BLOCK_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)args\s*=>\s*\{(.+?)\}").unwrap());
+
+    // Regex to find --key "value" pairs
+    static ARGS_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"--(\w+)\s+"([^"]+)""#).unwrap());
+
+    for cap in PERL_RE.captures_iter(response) {
+        let content = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+
+        // Extract tool name
+        let tool_name = TOOL_NAME_RE
+            .captures(content)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+
+        if tool_name.is_empty() {
+            continue;
+        }
+
+        // Extract args block
+        let args_block = ARGS_BLOCK_RE
+            .captures(content)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+
+        let mut arguments = serde_json::Map::new();
+
+        for arg_cap in ARGS_RE.captures_iter(args_block) {
+            let key = arg_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let value = arg_cap.get(2).map(|m| m.as_str()).unwrap_or("");
+
+            if !key.is_empty() {
+                arguments.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+        }
+
+        if !arguments.is_empty() {
+            calls.push(ParsedToolCall {
+                name: map_tool_name_alias(tool_name).to_string(),
+                arguments: serde_json::Value::Object(arguments),
+            });
+        }
+    }
+
+    calls
+}
+
+/// Parse FunctionCall-style tool calls from response text.
+/// This handles formats like:
+/// ```
+/// <FunctionCall>
+/// file_read
+/// <code>path>/Users/kylelampa/Documents/zeroclaw/README.md</code>
+/// </FunctionCall>
+/// ```
+fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
+    let mut calls = Vec::new();
+
+    // Regex to find <FunctionCall> blocks
+    static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<FunctionCall>\s*(\w+)\s*<code>([^<]+)</code>\s*</FunctionCall>").unwrap()
+    });
+
+    for cap in FUNC_RE.captures_iter(response) {
+        let tool_name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let args_text = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+
+        if tool_name.is_empty() {
+            continue;
+        }
+
+        // Parse key>value pairs (e.g., path>/Users/.../file.txt)
+        let mut arguments = serde_json::Map::new();
+        for line in args_text.lines() {
+            let line = line.trim();
+            if let Some(pos) = line.find('>') {
+                let key = line[..pos].trim();
+                let value = line[pos + 1..].trim();
+                if !key.is_empty() && !value.is_empty() {
+                    arguments.insert(
+                        key.to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    );
+                }
+            }
+        }
+
+        if !arguments.is_empty() {
+            calls.push(ParsedToolCall {
+                name: map_tool_name_alias(tool_name).to_string(),
+                arguments: serde_json::Value::Object(arguments),
+            });
+        }
+    }
+
+    calls
+}
+
 /// Parse GLM-style tool calls from response text.
-/// GLM uses proprietary formats like:
-/// - `browser_open/url>https://example.com`
-/// - `shell/command>ls -la`
-/// - `http_request/url>https://api.example.com`
-fn map_glm_tool_alias(tool_name: &str) -> &str {
+/// Map tool name aliases from various LLM providers to ZeroClaw tool names.
+/// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
+fn map_tool_name_alias(tool_name: &str) -> &str {
     match tool_name {
-        "browser_open" | "browser" | "web_search" | "shell" | "bash" => "shell",
-        "http_request" | "http" => "http_request",
+        // Shell variations
+        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "shell",
+        // File tool variations
+        "fileread" | "file_read" | "readfile" | "read_file" | "file" => "file_read",
+        "filewrite" | "file_write" | "writefile" | "write_file" => "file_write",
+        "filelist" | "file_list" | "listfiles" | "list_files" => "file_list",
+        // Memory variations
+        "memoryrecall" | "memory_recall" | "recall" | "memrecall" => "memory_recall",
+        "memorystore" | "memory_store" | "store" | "memstore" => "memory_store",
+        "memoryforget" | "memory_forget" | "forget" | "memforget" => "memory_forget",
+        // HTTP variations
+        "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
+        // GLM aliases
+        "browser_open" | "browser" | "web_search" => "shell",
         _ => tool_name,
     }
 }
@@ -524,7 +849,7 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
             let rest = &line[pos + 1..];
 
             if tool_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                let tool_name = map_glm_tool_alias(tool_part);
+                let tool_name = map_tool_name_alias(tool_part);
 
                 if let Some(gt_pos) = rest.find('>') {
                     let param_name = rest[..gt_pos].trim();
@@ -579,6 +904,17 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
     calls
 }
 
+// ── Tool-Call Parsing ─────────────────────────────────────────────────────
+// LLM responses may contain tool calls in multiple formats depending on
+// the provider. Parsing follows a priority chain:
+//   1. OpenAI-style JSON with `tool_calls` array (native API)
+//   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <invoke>
+//   3. Markdown code blocks with `tool_call` language
+//   4. GLM-style line-based format (e.g. `shell/command>ls`)
+// SECURITY: We never fall back to extracting arbitrary JSON from the
+// response body, because that would enable prompt-injection attacks where
+// malicious content in emails/files/web pages mimics a tool call.
+
 /// Parse tool calls from an LLM response that uses XML-style function calling.
 ///
 /// Expected format (common with system-prompt-guided tool use):
@@ -628,6 +964,8 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         if let Some(close_idx) = after_open.find(close_tag) {
             let inner = &after_open[..close_idx];
             let mut parsed_any = false;
+
+            // Try JSON format first
             let json_values = extract_json_values(inner);
             for value in json_values {
                 let parsed_calls = parse_tool_calls_from_json_value(&value);
@@ -637,8 +975,18 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            // If JSON parsing failed, try XML format (DeepSeek/GLM style)
             if !parsed_any {
-                tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
+                if let Some(xml_calls) = parse_xml_tool_calls(inner) {
+                    calls.extend(xml_calls);
+                    parsed_any = true;
+                }
+            }
+
+            if !parsed_any {
+                tracing::warn!(
+                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML)"
+                );
             }
 
             remaining = &after_open[close_idx + close_tag.len()..];
@@ -676,7 +1024,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     if calls.is_empty() {
         static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(
-                r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>)",
+                r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>|</minimax:toolcall>)",
             )
             .unwrap()
         });
@@ -704,6 +1052,99 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 md_text_parts.push(after.trim().to_string());
             }
             text_parts = md_text_parts;
+            remaining = "";
+        }
+    }
+
+    // XML attribute-style tool calls:
+    // <minimax:toolcall>
+    // <invoke name="shell">
+    // <parameter name="command">ls</parameter>
+    // </invoke>
+    // </minimax:toolcall>
+    if calls.is_empty() {
+        let xml_calls = parse_xml_attribute_tool_calls(remaining);
+        if !xml_calls.is_empty() {
+            let mut cleaned_text = remaining.to_string();
+            for call in xml_calls {
+                calls.push(call);
+                // Try to remove the XML from text
+                if let Some(start) = cleaned_text.find("<minimax:toolcall>") {
+                    if let Some(end) = cleaned_text.find("</minimax:toolcall>") {
+                        let end_pos = end + "</minimax:toolcall>".len();
+                        if end_pos <= cleaned_text.len() {
+                            cleaned_text =
+                                format!("{}{}", &cleaned_text[..start], &cleaned_text[end_pos..]);
+                        }
+                    }
+                }
+            }
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
+            remaining = "";
+        }
+    }
+
+    // Perl/hash-ref style tool calls:
+    // TOOL_CALL
+    // {tool => "shell", args => {
+    //   --command "ls -la"
+    //   --description "List current directory contents"
+    // }}
+    // /TOOL_CALL
+    if calls.is_empty() {
+        let perl_calls = parse_perl_style_tool_calls(remaining);
+        if !perl_calls.is_empty() {
+            let mut cleaned_text = remaining.to_string();
+            for call in perl_calls {
+                calls.push(call);
+                // Try to remove the TOOL_CALL block from text
+                while let Some(start) = cleaned_text.find("TOOL_CALL") {
+                    if let Some(end) = cleaned_text.find("/TOOL_CALL") {
+                        let end_pos = end + "/TOOL_CALL".len();
+                        if end_pos <= cleaned_text.len() {
+                            cleaned_text =
+                                format!("{}{}", &cleaned_text[..start], &cleaned_text[end_pos..]);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
+            remaining = "";
+        }
+    }
+
+    // <FunctionCall>
+    // file_read
+    // <code>path>/Users/...</code>
+    // </FunctionCall>
+    if calls.is_empty() {
+        let func_calls = parse_function_call_tool_calls(remaining);
+        if !func_calls.is_empty() {
+            let mut cleaned_text = remaining.to_string();
+            for call in func_calls {
+                calls.push(call);
+                // Try to remove the FunctionCall block from text
+                while let Some(start) = cleaned_text.find("<FunctionCall>") {
+                    if let Some(end) = cleaned_text.find("</FunctionCall>") {
+                        let end_pos = end + "</FunctionCall>".len();
+                        if end_pos <= cleaned_text.len() {
+                            cleaned_text =
+                                format!("{}{}", &cleaned_text[..start], &cleaned_text[end_pos..]);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
             remaining = "";
         }
     }
@@ -813,6 +1254,21 @@ struct ParsedToolCall {
     arguments: serde_json::Value,
 }
 
+#[derive(Debug)]
+pub(crate) struct ToolLoopCancelled;
+
+impl std::fmt::Display for ToolLoopCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop cancelled")
+    }
+}
+
+impl std::error::Error for ToolLoopCancelled {}
+
+pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| source.is::<ToolLoopCancelled>())
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -826,6 +1282,7 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
+    multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -839,11 +1296,165 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        multimodal_config,
         max_tool_iterations,
+        None,
+        None,
         None,
     )
     .await
 }
+
+async fn execute_one_tool(
+    call_name: &str,
+    call_arguments: serde_json::Value,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<String> {
+    let Some(tool) = find_tool(tools_registry, call_name) else {
+        return Ok(format!("Unknown tool: {call_name}"));
+    };
+
+    observer.record_event(&ObserverEvent::ToolCallStart {
+        tool: call_name.to_string(),
+    });
+    let start = Instant::now();
+
+    let tool_future = tool.execute(call_arguments);
+    let tool_result = if let Some(token) = cancellation_token {
+        tokio::select! {
+            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+            result = tool_future => result,
+        }
+    } else {
+        tool_future.await
+    };
+
+    match tool_result {
+        Ok(r) => {
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call_name.to_string(),
+                duration: start.elapsed(),
+                success: r.success,
+            });
+            if r.success {
+                Ok(scrub_credentials(&r.output))
+            } else {
+                Ok(format!("Error: {}", r.error.unwrap_or_else(|| r.output)))
+            }
+        }
+        Err(e) => {
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call_name.to_string(),
+                duration: start.elapsed(),
+                success: false,
+            });
+            Ok(format!("Error executing {call_name}: {e}"))
+        }
+    }
+}
+
+fn should_execute_tools_in_parallel(
+    tool_calls: &[ParsedToolCall],
+    approval: Option<&ApprovalManager>,
+) -> bool {
+    if tool_calls.len() <= 1 {
+        return false;
+    }
+
+    if let Some(mgr) = approval {
+        if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
+            // Approval-gated calls must keep sequential handling so the caller can
+            // enforce CLI prompt/deny policy consistently.
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn execute_tools_parallel(
+    tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<Vec<String>> {
+    let futures: Vec<_> = tool_calls
+        .iter()
+        .map(|call| {
+            execute_one_tool(
+                &call.name,
+                call.arguments.clone(),
+                tools_registry,
+                observer,
+                cancellation_token,
+            )
+        })
+        .collect();
+
+    let results = futures_util::future::join_all(futures).await;
+    results.into_iter().collect()
+}
+
+async fn execute_tools_sequential(
+    tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<Vec<String>> {
+    let mut individual_results: Vec<String> = Vec::with_capacity(tool_calls.len());
+
+    for call in tool_calls {
+        if let Some(mgr) = approval {
+            if mgr.needs_approval(&call.name) {
+                let request = ApprovalRequest {
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                };
+
+                let decision = if channel_name == "cli" {
+                    mgr.prompt_cli(&request)
+                } else {
+                    ApprovalResponse::No
+                };
+
+                mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+
+                if decision == ApprovalResponse::No {
+                    individual_results.push("Denied by user.".to_string());
+                    continue;
+                }
+            }
+        }
+
+        let result = execute_one_tool(
+            &call.name,
+            call.arguments.clone(),
+            tools_registry,
+            observer,
+            cancellation_token,
+        )
+        .await?;
+        individual_results.push(result);
+    }
+
+    Ok(individual_results)
+}
+
+// ── Agent Tool-Call Loop ──────────────────────────────────────────────────
+// Core agentic iteration: send conversation to the LLM, parse any tool
+// calls from the response, execute them, append results to history, and
+// repeat until the LLM produces a final text-only answer.
+//
+// Loop invariant: at the start of each iteration, `history` contains the
+// full conversation so far (system prompt + user messages + prior tool
+// results). The loop exits when:
+//   • the LLM returns no tool calls (final answer), or
+//   • max_iterations is reached (runaway safety), or
+//   • the cancellation token fires (external abort).
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
@@ -859,8 +1470,11 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -873,6 +1487,28 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
+        if cancellation_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolLoopCancelled.into());
+        }
+
+        let image_marker_count = multimodal::count_image_markers(history);
+        if image_marker_count > 0 && !provider.supports_vision() {
+            return Err(ProviderCapabilityError {
+                provider: provider_name.to_string(),
+                capability: "vision".to_string(),
+                message: format!(
+                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                ),
+            }
+            .into());
+        }
+
+        let prepared_messages =
+            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
             model: model.to_string(),
@@ -880,6 +1516,11 @@ pub(crate) async fn run_tool_call_loop(
         });
 
         let llm_started_at = Instant::now();
+
+        // Fire void hook before LLM call
+        if let Some(hooks) = hooks {
+            hooks.fire_llm_input(history, model).await;
+        }
 
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -889,28 +1530,48 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
+        let chat_future = provider.chat(
+            ChatRequest {
+                messages: &prepared_messages.messages,
+                tools: request_tools,
+            },
+            model,
+            temperature,
+        );
+
+        let chat_result = if let Some(token) = cancellation_token.as_ref() {
+            tokio::select! {
+                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                result = chat_future => result,
+            }
+        } else {
+            chat_future.await
+        };
+
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match provider
-                .chat(
-                    ChatRequest {
-                        messages: history,
-                        tools: request_tools,
-                    },
-                    model,
-                    temperature,
-                )
-                .await
-            {
+            match chat_result {
                 Ok(resp) => {
+                    let (resp_input_tokens, resp_output_tokens) = resp
+                        .usage
+                        .as_ref()
+                        .map(|u| (u.input_tokens, u.output_tokens))
+                        .unwrap_or((None, None));
+
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
                         duration: llm_started_at.elapsed(),
                         success: true,
                         error_message: None,
+                        input_tokens: resp_input_tokens,
+                        output_tokens: resp_output_tokens,
                     });
 
                     let response_text = resp.text_or_empty().to_string();
+                    // First try native structured tool calls (OpenAI-format).
+                    // Fall back to text-based parsing (XML tags, markdown blocks,
+                    // GLM format) only if the provider returned no native calls —
+                    // this ensures we support both native and prompt-guided models.
                     let mut calls = parse_structured_tool_calls(&resp.tool_calls);
                     let mut parsed_text = String::new();
 
@@ -946,6 +1607,8 @@ pub(crate) async fn run_tool_call_loop(
                         duration: llm_started_at.elapsed(),
                         success: false,
                         error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                        input_tokens: None,
+                        output_tokens: None,
                     });
                     return Err(e);
                 }
@@ -966,6 +1629,12 @@ pub(crate) async fn run_tool_call_loop(
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
+                    if cancellation_token
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(ToolLoopCancelled.into());
+                    }
                     chunk.push_str(word);
                     if chunk.len() >= STREAM_CHUNK_MIN_CHARS
                         && tx.send(std::mem::take(&mut chunk)).await.is_err()
@@ -987,18 +1656,43 @@ pub(crate) async fn run_tool_call_loop(
             let _ = std::io::stdout().flush();
         }
 
-        // Execute each tool call and build results.
-        // `individual_results` tracks per-call output so that native-mode history
-        // can emit one `role: tool` message per tool call with the correct ID.
+        // Execute tool calls and build results. `individual_results` tracks per-call output so
+        // native-mode history can emit one role=tool message per tool call with the correct ID.
+        //
+        // When multiple tool calls are present and interactive CLI approval is not needed, run
+        // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
         let mut individual_results: Vec<String> = Vec::new();
         for call in &tool_calls {
+            // ── Hook: before_tool_call (modifying) ──────────
+            let mut tool_name = call.name.clone();
+            let mut tool_args = call.arguments.clone();
+            if let Some(hooks) = hooks {
+                match hooks.run_before_tool_call(tool_name, tool_args).await {
+                    crate::hooks::HookResult::Cancel(reason) => {
+                        tracing::info!(tool = %call.name, %reason, "tool call cancelled by hook");
+                        let cancelled = format!("Cancelled by hook: {reason}");
+                        individual_results.push(cancelled.clone());
+                        let _ = writeln!(
+                            tool_results,
+                            "<tool_result name=\"{}\">\n{cancelled}\n</tool_result>",
+                            call.name
+                        );
+                        continue;
+                    }
+                    crate::hooks::HookResult::Continue((name, args)) => {
+                        tool_name = name;
+                        tool_args = args;
+                    }
+                }
+            }
+
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
-                if mgr.needs_approval(&call.name) {
+                if mgr.needs_approval(&tool_name) {
                     let request = ApprovalRequest {
-                        tool_name: call.name.clone(),
-                        arguments: call.arguments.clone(),
+                        tool_name: tool_name.clone(),
+                        arguments: tool_args.clone(),
                     };
 
                     // Only prompt interactively on CLI; auto-approve on other channels.
@@ -1008,7 +1702,7 @@ pub(crate) async fn run_tool_call_loop(
                         ApprovalResponse::Yes
                     };
 
-                    mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+                    mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
 
                     if decision == ApprovalResponse::No {
                         let denied = "Denied by user.".to_string();
@@ -1016,7 +1710,7 @@ pub(crate) async fn run_tool_call_loop(
                         let _ = writeln!(
                             tool_results,
                             "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
-                            call.name
+                            tool_name
                         );
                         continue;
                     }
@@ -1024,41 +1718,55 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             observer.record_event(&ObserverEvent::ToolCallStart {
-                tool: call.name.clone(),
+                tool: tool_name.clone(),
             });
             let start = Instant::now();
-            let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                match tool.execute(call.arguments.clone()).await {
+            let (result, tool_success) = if let Some(tool) = find_tool(tools_registry, &tool_name) {
+                match tool.execute(tool_args).await {
                     Ok(r) => {
+                        let success = r.success;
                         observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
+                            tool: tool_name.clone(),
                             duration: start.elapsed(),
-                            success: r.success,
+                            success,
                         });
-                        if r.success {
+                        let output = if r.success {
                             scrub_credentials(&r.output)
                         } else {
                             format!("Error: {}", r.error.unwrap_or_else(|| r.output))
-                        }
+                        };
+                        (output, success)
                     }
                     Err(e) => {
                         observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
+                            tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: false,
                         });
-                        format!("Error executing {}: {e}", call.name)
+                        (format!("Error executing {}: {e}", tool_name), false)
                     }
                 }
             } else {
-                format!("Unknown tool: {}", call.name)
+                (format!("Unknown tool: {}", tool_name), false)
             };
+
+            // ── Hook: after_tool_call (void) ─────────────────
+            if let Some(hooks) = hooks {
+                let tool_result_obj = crate::tools::ToolResult {
+                    success: tool_success,
+                    output: result.clone(),
+                    error: None,
+                };
+                hooks
+                    .fire_after_tool_call(&tool_name, &tool_result_obj, start.elapsed())
+                    .await;
+            }
 
             individual_results.push(result.clone());
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result
+                tool_name, result
             );
         }
 
@@ -1112,6 +1820,12 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 
     instructions
 }
+
+// ── CLI Entrypoint ───────────────────────────────────────────────────────
+// Wires up all subsystems (observer, runtime, security, memory, tools,
+// provider, hardware RAG, peripherals) and enters either single-shot or
+// interactive REPL mode. The interactive loop manages history compaction
+// and hard trimming to keep the context window bounded.
 
 #[allow(clippy::too_many_lines)]
 pub async fn run(
@@ -1191,13 +1905,21 @@ pub async fn run(
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4");
 
-    let provider: Box<dyn Provider> = providers::create_routed_provider(
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+    };
+
+    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
         model_name,
+        &provider_runtime_options,
     )?;
 
     observer.record_event(&ObserverEvent::AgentStart {
@@ -1226,7 +1948,7 @@ pub async fn run(
         .collect();
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -1336,17 +2058,22 @@ pub async fn run(
     } else {
         None
     };
-    let mut system_prompt = crate::channels::build_system_prompt(
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
+        config.skills.prompt_injection_mode,
     );
 
-    // Append structured tool-use instructions with schemas
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    // Append structured tool-use instructions with schemas (only for non-native providers)
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = ApprovalManager::from_config(&config.autonomy);
@@ -1357,8 +2084,8 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory
-        if config.memory.auto_save {
+        // Auto-save user message to memory (skip short/trivial messages)
+        if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
                 .store(&user_key, &msg, MemoryCategory::Conversation, None)
@@ -1396,22 +2123,16 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            &config.multimodal,
             config.agent.max_tool_iterations,
+            None,
+            None,
             None,
         )
         .await?;
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
-
-        // Auto-save assistant response to daily log
-        if config.memory.auto_save {
-            let summary = truncate_with_ellipsis(&response, 100);
-            let response_key = autosave_memory_key("assistant_resp");
-            let _ = mem
-                .store(&response_key, &summary, MemoryCategory::Daily, None)
-                .await;
-        }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
@@ -1486,8 +2207,8 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns
-            if config.memory.auto_save {
+            // Auto-save conversation turns (skip short/trivial messages)
+            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)
@@ -1522,7 +2243,10 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                &config.multimodal,
                 config.agent.max_tool_iterations,
+                None,
+                None,
                 None,
             )
             .await
@@ -1560,14 +2284,6 @@ pub async fn run(
 
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
-
-            if config.memory.auto_save {
-                let summary = truncate_with_ellipsis(&response, 100);
-                let response_key = autosave_memory_key("assistant_resp");
-                let _ = mem
-                    .store(&response_key, &summary, MemoryCategory::Daily, None)
-                    .await;
-            }
         }
     }
 
@@ -1632,13 +2348,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let provider: Box<dyn Provider> = providers::create_routed_provider(
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+    };
+    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
         config.api_key.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
         &model_name,
+        &provider_runtime_options,
     )?;
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -1656,7 +2379,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .map(|b| b.board.clone())
         .collect();
 
-    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
@@ -1705,15 +2428,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         None
     };
-    let mut system_prompt = crate::channels::build_system_prompt(
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         &model_name,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
+        config.skills.prompt_injection_mode,
     );
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -1742,6 +2470,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         config.default_temperature,
         true,
+        &config.multimodal,
         config.agent.max_tool_iterations,
     )
     .await
@@ -1750,6 +2479,12 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn test_scrub_credentials() {
@@ -1770,7 +2505,455 @@ mod tests {
         assert!(scrubbed.contains("public"));
     }
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use crate::observability::NoopObserver;
+    use crate::providers::traits::ProviderCapabilities;
+    use crate::providers::ChatResponse;
     use tempfile::TempDir;
+
+    struct NonVisionProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for NonVisionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".to_string())
+        }
+    }
+
+    struct VisionProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for VisionProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let marker_count = crate::multimodal::count_image_markers(request.messages);
+            if marker_count == 0 {
+                anyhow::bail!("expected image markers in request messages");
+            }
+
+            if request.tools.is_some() {
+                anyhow::bail!("no tools should be attached for this test");
+            }
+
+            Ok(ChatResponse {
+                text: Some("vision-ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    struct ScriptedProvider {
+        responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+    }
+
+    impl ScriptedProvider {
+        fn from_text_responses(responses: Vec<&str>) -> Self {
+            let scripted = responses
+                .into_iter()
+                .map(|text| ChatResponse {
+                    text: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })
+                .collect();
+            Self {
+                responses: Arc::new(Mutex::new(scripted)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in scripted provider tests");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let mut responses = self
+                .responses
+                .lock()
+                .expect("responses lock should be valid");
+            responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct DelayTool {
+        name: String,
+        delay_ms: u64,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl DelayTool {
+        fn new(
+            name: &str,
+            delay_ms: u64,
+            active: Arc<AtomicUsize>,
+            max_active: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                name: name.to_string(),
+                delay_ms,
+                active,
+                max_active,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for DelayTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Delay tool for testing parallel tool execution"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                },
+                "required": ["value"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let now_active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now_active, Ordering::SeqCst);
+
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+
+            self.active.fetch_sub(1, Ordering::SeqCst);
+
+            let value = args
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: format!("ok:{value}"),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+        )
+        .await
+        .expect_err("provider without vision support should fail");
+
+        assert!(err.to_string().contains("provider_capability_error"));
+        assert!(err.to_string().contains("capability=vision"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_rejects_oversized_image_payload() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = VisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
+        let mut history = vec![ChatMessage::user(format!(
+            "[IMAGE:data:image/png;base64,{oversized_payload}]"
+        ))];
+
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let multimodal = crate::config::MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 1,
+            allow_remote_fetch: false,
+        };
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &multimodal,
+            3,
+            None,
+            None,
+        )
+        .await
+        .expect_err("oversized payload must fail");
+
+        assert!(err
+            .to_string()
+            .contains("multimodal image size limit exceeded"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_accepts_valid_multimodal_request_flow() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = VisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+        )
+        .await
+        .expect("valid multimodal payload should pass");
+
+        assert_eq!(result, "vision-ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_false_for_single_call() {
+        let calls = vec![ParsedToolCall {
+            name: "file_read".to_string(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        }];
+
+        assert!(!should_execute_tools_in_parallel(&calls, None));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_false_when_approval_is_required() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "pwd"}),
+            },
+            ParsedToolCall {
+                name: "http_request".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com"}),
+            },
+        ];
+        let approval_cfg = crate::config::AutonomyConfig::default();
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        assert!(!should_execute_tools_in_parallel(
+            &calls,
+            Some(&approval_mgr)
+        ));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_true_when_cli_has_no_interactive_approvals() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "pwd"}),
+            },
+            ParsedToolCall {
+                name: "http_request".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com"}),
+            },
+        ];
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        assert!(should_execute_tools_in_parallel(
+            &calls,
+            Some(&approval_mgr)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_executes_multiple_tools_in_parallel_with_ordered_results() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_a","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"delay_b","arguments":{"value":"B"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(DelayTool::new(
+                "delay_a",
+                200,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_b",
+                200,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+        ];
+
+        let approval_cfg = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let started = std::time::Instant::now();
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+        )
+        .await
+        .expect("parallel execution should complete");
+        let elapsed = started.elapsed();
+
+        assert_eq!(result, "done");
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "parallel execution should be faster than sequential fallback; elapsed={elapsed:?}"
+        );
+        assert!(
+            max_active.load(Ordering::SeqCst) >= 2,
+            "both tools should overlap in execution"
+        );
+
+        let tool_results_message = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        let idx_a = tool_results_message
+            .content
+            .find("name=\"delay_a\"")
+            .expect("delay_a result should be present");
+        let idx_b = tool_results_message
+            .content
+            .find("name=\"delay_b\"")
+            .expect("delay_b result should be present");
+        assert!(
+            idx_a < idx_b,
+            "tool results should preserve input order for tool call mapping"
+        );
+    }
 
     #[test]
     fn parse_tool_calls_extracts_single_call() {
@@ -1897,6 +3080,59 @@ After text."#;
         let response = r#"<tool_call>
 I will now call the tool with this payload:
 {"name": "shell", "arguments": {"command": "pwd"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_xml_nested_tool_payload() {
+        let response = r#"<tool_call>
+<memory_recall>
+<query>project roadmap</query>
+</memory_recall>
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_recall");
+        assert_eq!(
+            calls[0].arguments.get("query").unwrap().as_str().unwrap(),
+            "project roadmap"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_ignores_xml_thinking_wrapper() {
+        let response = r#"<tool_call>
+<thinking>Need to inspect memory first</thinking>
+<memory_recall>
+<query>recent deploy notes</query>
+</memory_recall>
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_recall");
+        assert_eq!(
+            calls[0].arguments.get("query").unwrap().as_str().unwrap(),
+            "recent deploy notes"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_xml_with_json_arguments() {
+        let response = r#"<tool_call>
+<shell>{"command":"pwd"}</shell>
 </tool_call>"#;
 
         let (text, calls) = parse_tool_calls(response);
@@ -2215,6 +3451,33 @@ Done."#;
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
+    #[tokio::test]
+    async fn build_context_ignores_legacy_assistant_autosave_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "assistant_resp_poisoned",
+            "User suffered a fabricated event",
+            MemoryCategory::Daily,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_msg_real",
+            "User asked for concise status updates",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "status updates", 0.0).await;
+        assert!(context.contains("user_msg_real"));
+        assert!(!context.contains("assistant_resp_poisoned"));
+        assert!(!context.contains("fabricated event"));
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Tool Call Parsing Edge Cases
     // ═══════════════════════════════════════════════════════════════════════
@@ -2396,6 +3659,36 @@ Done."#;
     }
 
     #[test]
+    fn parse_tool_call_value_accepts_top_level_parameters_alias() {
+        let value = serde_json::json!({
+            "name": "schedule",
+            "parameters": {"action": "create", "message": "test"}
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "schedule");
+        assert_eq!(
+            result.arguments.get("action").and_then(|v| v.as_str()),
+            Some("create")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_function_parameters_alias() {
+        let value = serde_json::json!({
+            "function": {
+                "name": "shell",
+                "parameters": {"command": "date"}
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("date")
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_from_json_value_handles_empty_array() {
         // Recovery: Empty tool_calls array should return empty vec
         let value = serde_json::json!({"tool_calls": []});
@@ -2510,5 +3803,253 @@ browser_open/url>https://example.com"#;
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments["command"], "pwd");
         assert_eq!(text, "Done");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): parse_tool_calls robustness — malformed/edge-case inputs
+    // Prevents: Pattern 4 issues #746, #418, #777, #848
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tool_calls_empty_input_returns_empty() {
+        let (text, calls) = parse_tool_calls("");
+        assert!(calls.is_empty(), "empty input should produce no tool calls");
+        assert!(text.is_empty(), "empty input should produce no text");
+    }
+
+    #[test]
+    fn parse_tool_calls_whitespace_only_returns_empty_calls() {
+        let (text, calls) = parse_tool_calls("   \n\t  ");
+        assert!(calls.is_empty());
+        assert!(text.is_empty() || text.trim().is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_nested_xml_tags_handled() {
+        // Double-wrapped tool call should still parse the inner call
+        let response = r#"<tool_call><tool_call>{"name":"echo","arguments":{"msg":"hi"}}</tool_call></tool_call>"#;
+        let (_text, calls) = parse_tool_calls(response);
+        // Should find at least one tool call
+        assert!(
+            !calls.is_empty(),
+            "nested XML tags should still yield at least one tool call"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_truncated_json_no_panic() {
+        // Incomplete JSON inside tool_call tags
+        let response = r#"<tool_call>{"name":"shell","arguments":{"command":"ls"</tool_call>"#;
+        let (_text, _calls) = parse_tool_calls(response);
+        // Should not panic — graceful handling of truncated JSON
+    }
+
+    #[test]
+    fn parse_tool_calls_empty_json_object_in_tag() {
+        let response = "<tool_call>{}</tool_call>";
+        let (_text, calls) = parse_tool_calls(response);
+        // Empty JSON object has no name field — should not produce valid tool call
+        assert!(
+            calls.is_empty(),
+            "empty JSON object should not produce a tool call"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_closing_tag_only_returns_text() {
+        let response = "Some text </tool_call> more text";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "closing tag only should not produce calls"
+        );
+        assert!(
+            !text.is_empty(),
+            "text around orphaned closing tag should be preserved"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_very_large_arguments_no_panic() {
+        let large_arg = "x".repeat(100_000);
+        let response = format!(
+            r#"<tool_call>{{"name":"echo","arguments":{{"message":"{}"}}}}</tool_call>"#,
+            large_arg
+        );
+        let (_text, calls) = parse_tool_calls(&response);
+        assert_eq!(calls.len(), 1, "large arguments should still parse");
+        assert_eq!(calls[0].name, "echo");
+    }
+
+    #[test]
+    fn parse_tool_calls_special_characters_in_arguments() {
+        let response = r#"<tool_call>{"name":"echo","arguments":{"message":"hello \"world\" <>&'\n\t"}}</tool_call>"#;
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "echo");
+    }
+
+    #[test]
+    fn parse_tool_calls_text_with_embedded_json_not_extracted() {
+        // Raw JSON without any tags should NOT be extracted as a tool call
+        let response = r#"Here is some data: {"name":"echo","arguments":{"message":"hi"}} end."#;
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "raw JSON in text without tags should not be extracted"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_multiple_formats_mixed() {
+        // Mix of text and properly tagged tool call
+        let response = r#"I'll help you with that.
+
+<tool_call>
+{"name":"shell","arguments":{"command":"echo hello"}}
+</tool_call>
+
+Let me check the result."#;
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(
+            calls.len(),
+            1,
+            "should extract one tool call from mixed content"
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert!(
+            text.contains("help you"),
+            "text before tool call should be preserved"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): scrub_credentials edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scrub_credentials_empty_input() {
+        let result = scrub_credentials("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn scrub_credentials_no_sensitive_data() {
+        let input = "normal text without any secrets";
+        let result = scrub_credentials(input);
+        assert_eq!(
+            result, input,
+            "non-sensitive text should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_short_values_not_redacted() {
+        // Values shorter than 8 chars should not be redacted
+        let input = r#"api_key="short""#;
+        let result = scrub_credentials(input);
+        assert_eq!(result, input, "short values should not be redacted");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): trim_history edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn trim_history_empty_history() {
+        let mut history: Vec<crate::providers::ChatMessage> = vec![];
+        trim_history(&mut history, 10);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn trim_history_system_only() {
+        let mut history = vec![crate::providers::ChatMessage::system("system prompt")];
+        trim_history(&mut history, 10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "system");
+    }
+
+    #[test]
+    fn trim_history_exactly_at_limit() {
+        let mut history = vec![
+            crate::providers::ChatMessage::system("system"),
+            crate::providers::ChatMessage::user("msg 1"),
+            crate::providers::ChatMessage::assistant("reply 1"),
+        ];
+        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
+        assert_eq!(history.len(), 3, "should not trim when exactly at limit");
+    }
+
+    #[test]
+    fn trim_history_removes_oldest_non_system() {
+        let mut history = vec![
+            crate::providers::ChatMessage::system("system"),
+            crate::providers::ChatMessage::user("old msg"),
+            crate::providers::ChatMessage::assistant("old reply"),
+            crate::providers::ChatMessage::user("new msg"),
+            crate::providers::ChatMessage::assistant("new reply"),
+        ];
+        trim_history(&mut history, 2);
+        assert_eq!(history.len(), 3); // system + 2 kept
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].content, "new msg");
+    }
+
+    /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
+    /// the output must contain ZERO XML protocol artifacts. In the native path
+    /// `build_tool_instructions` is never called, so the system prompt alone
+    /// must be clean of XML tool-call protocol.
+    #[test]
+    fn native_tools_system_prompt_contains_zero_xml() {
+        use crate::channels::build_system_prompt_with_mode;
+
+        let tool_summaries: Vec<(&str, &str)> = vec![
+            ("shell", "Execute shell commands"),
+            ("file_read", "Read files"),
+        ];
+
+        let system_prompt = build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &tool_summaries,
+            &[],  // no skills
+            None, // no identity config
+            None, // no bootstrap_max_chars
+            true, // native_tools
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+
+        // Must contain zero XML protocol artifacts
+        assert!(
+            !system_prompt.contains("<tool_call>"),
+            "Native prompt must not contain <tool_call>"
+        );
+        assert!(
+            !system_prompt.contains("</tool_call>"),
+            "Native prompt must not contain </tool_call>"
+        );
+        assert!(
+            !system_prompt.contains("<tool_result>"),
+            "Native prompt must not contain <tool_result>"
+        );
+        assert!(
+            !system_prompt.contains("</tool_result>"),
+            "Native prompt must not contain </tool_result>"
+        );
+        assert!(
+            !system_prompt.contains("## Tool Use Protocol"),
+            "Native prompt must not contain XML protocol header"
+        );
+
+        // Positive: native prompt should still list tools and contain task instructions
+        assert!(
+            system_prompt.contains("shell"),
+            "Native prompt must list tool names"
+        );
+        assert!(
+            system_prompt.contains("## Your Task"),
+            "Native prompt should contain task instructions"
+        );
     }
 }

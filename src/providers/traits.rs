@@ -49,6 +49,13 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Raw token counts from a single LLM API response.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -56,6 +63,8 @@ pub struct ChatResponse {
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage reported by the provider, if available.
+    pub usage: Option<TokenUsage>,
 }
 
 impl ChatResponse {
@@ -192,6 +201,15 @@ pub enum StreamError {
     Io(#[from] std::io::Error),
 }
 
+/// Structured error returned when a requested capability is not supported.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("provider_capability_error provider={provider} capability={capability} message={message}")]
+pub struct ProviderCapabilityError {
+    pub provider: String,
+    pub capability: String,
+    pub message: String,
+}
+
 /// Provider capabilities declaration.
 ///
 /// Describes what features a provider supports, enabling intelligent
@@ -205,6 +223,8 @@ pub struct ProviderCapabilities {
     ///
     /// When `false`, tools must be injected via system prompt as text.
     pub native_tool_calling: bool,
+    /// Whether the provider supports vision / image inputs.
+    pub vision: bool,
 }
 
 /// Provider-specific tool payload formats.
@@ -333,6 +353,7 @@ pub trait Provider: Send + Sync {
                 return Ok(ChatResponse {
                     text: Some(text),
                     tool_calls: Vec::new(),
+                    usage: None,
                 });
             }
         }
@@ -343,12 +364,18 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 
     /// Whether provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
         self.capabilities().native_tool_calling
+    }
+
+    /// Whether provider supports multimodal vision input.
+    fn supports_vision(&self) -> bool {
+        self.capabilities().vision
     }
 
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
@@ -371,6 +398,7 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 
@@ -458,6 +486,7 @@ mod tests {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: true,
+                vision: true,
             }
         }
 
@@ -493,6 +522,7 @@ mod tests {
         let empty = ChatResponse {
             text: None,
             tool_calls: vec![],
+            usage: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -504,9 +534,31 @@ mod tests {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
+            usage: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
+    }
+
+    #[test]
+    fn token_usage_default_is_none() {
+        let usage = TokenUsage::default();
+        assert!(usage.input_tokens.is_none());
+        assert!(usage.output_tokens.is_none());
+    }
+
+    #[test]
+    fn chat_response_with_usage() {
+        let resp = ChatResponse {
+            text: Some("Hello".into()),
+            tool_calls: vec![],
+            usage: Some(TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+            }),
+        };
+        assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
+        assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));
     }
 
     #[test]
@@ -539,18 +591,22 @@ mod tests {
     fn provider_capabilities_default() {
         let caps = ProviderCapabilities::default();
         assert!(!caps.native_tool_calling);
+        assert!(!caps.vision);
     }
 
     #[test]
     fn provider_capabilities_equality() {
         let caps1 = ProviderCapabilities {
             native_tool_calling: true,
+            vision: false,
         };
         let caps2 = ProviderCapabilities {
             native_tool_calling: true,
+            vision: false,
         };
         let caps3 = ProviderCapabilities {
             native_tool_calling: false,
+            vision: false,
         };
 
         assert_eq!(caps1, caps2);
@@ -561,6 +617,12 @@ mod tests {
     fn supports_native_tools_reflects_capabilities_default_mapping() {
         let provider = CapabilityMockProvider;
         assert!(provider.supports_native_tools());
+    }
+
+    #[test]
+    fn supports_vision_reflects_capabilities_default_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(provider.supports_vision());
     }
 
     #[test]

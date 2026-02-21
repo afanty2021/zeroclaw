@@ -7,10 +7,10 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::channels::{Channel, SendMessage, WhatsAppChannel};
+use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
@@ -51,6 +51,14 @@ fn webhook_memory_key() -> String {
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -274,6 +282,12 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    pub linq: Option<Arc<LinqChannel>>,
+    /// Linq webhook signing secret for signature verification
+    pub linq_signing_secret: Option<Arc<str>>,
+    pub nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    /// Nextcloud Talk webhook secret for signature verification
+    pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
 }
@@ -292,6 +306,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
 
+    // ── Hooks ──────────────────────────────────────────────────────
+    let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+        Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
+    } else {
+        None
+    };
+
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
@@ -306,6 +327,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             auth_profile_override: None,
             zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
+            reasoning_enabled: config.runtime.reasoning_enabled,
         },
     )?);
     let model = config
@@ -360,12 +382,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
 
     // WhatsApp channel (if configured)
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
-        config.channels_config.whatsapp.as_ref().map(|wa| {
+    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .filter(|wa| wa.is_cloud_config())
+        .map(|wa| {
             Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone(),
-                wa.phone_number_id.clone(),
-                wa.verify_token.clone(),
+                wa.access_token.clone().unwrap_or_default(),
+                wa.phone_number_id.clone().unwrap_or_default(),
+                wa.verify_token.clone().unwrap_or_default(),
                 wa.allowed_numbers.clone(),
             ))
         });
@@ -388,6 +414,68 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
         })
         .map(Arc::from);
+
+    // Linq channel (if configured)
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
+        Arc::new(LinqChannel::new(
+            lq.api_token.clone(),
+            lq.from_phone.clone(),
+            lq.allowed_senders.clone(),
+        ))
+    });
+
+    // Linq signing secret for webhook signature verification
+    // Priority: environment variable > config file
+    let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
+        .ok()
+        .and_then(|secret| {
+            let secret = secret.trim();
+            (!secret.is_empty()).then(|| secret.to_owned())
+        })
+        .or_else(|| {
+            config.channels_config.linq.as_ref().and_then(|lq| {
+                lq.signing_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|secret| !secret.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .map(Arc::from);
+
+    // Nextcloud Talk channel (if configured)
+    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
+        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.allowed_users.clone(),
+            ))
+        });
+
+    // Nextcloud Talk webhook secret for signature verification
+    // Priority: environment variable > config file
+    let nextcloud_talk_webhook_secret: Option<Arc<str>> =
+        std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
+            .ok()
+            .and_then(|secret| {
+                let secret = secret.trim();
+                (!secret.is_empty()).then(|| secret.to_owned())
+            })
+            .or_else(|| {
+                config
+                    .channels_config
+                    .nextcloud_talk
+                    .as_ref()
+                    .and_then(|nc| {
+                        nc.webhook_secret
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|secret| !secret.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+            })
+            .map(Arc::from);
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
@@ -440,6 +528,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    if linq_channel.is_some() {
+        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
+    }
+    if nextcloud_talk_channel.is_some() {
+        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
+    }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -457,6 +551,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  Press Ctrl+C to stop.\n");
 
     crate::health::mark_component_ok("gateway");
+
+    // Fire gateway start hook
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_start(host, actual_port).await;
+    }
 
     // Build shared state
     let observer: Arc<dyn crate::observability::Observer> =
@@ -476,6 +575,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        linq: linq_channel,
+        linq_signing_secret,
+        nextcloud_talk: nextcloud_talk_channel,
+        nextcloud_talk_webhook_secret,
         observer,
     };
 
@@ -487,6 +590,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/linq", post(handle_linq_webhook))
+        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -542,15 +647,16 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /pair — exchange one-time code for bearer token
+#[axum::debug_handler]
 async fn handle_pair(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_pair(&client_key) {
-        tracing::warn!("/pair rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_pair(&rate_key) {
+        tracing::warn!("/pair rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many pairing requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -563,10 +669,10 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code) {
+    match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) = persist_pairing_tokens(&state.config, &state.pairing) {
+            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
                 tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
                 let body = serde_json::json!({
                     "paired": true,
@@ -603,12 +709,62 @@ async fn handle_pair(
     }
 }
 
-fn persist_pairing_tokens(config: &Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
-    let mut cfg = config.lock();
-    cfg.gateway.paired_tokens = paired_tokens;
-    cfg.save()
-        .context("Failed to persist paired tokens to config.toml")
+    // This is needed because parking_lot's guard is not Send so we clone the inner
+    // this should be removed once async mutexes are used everywhere
+    let mut updated_cfg = { config.lock().clone() };
+    updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg
+        .save()
+        .await
+        .context("Failed to persist paired tokens to config.toml")?;
+
+    // Keep shared runtime config in sync with persisted tokens.
+    *config.lock() = updated_cfg;
+    Ok(())
+}
+
+/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+async fn run_gateway_chat_simple(
+    state: &AppState,
+    provider_label: &str,
+    message: &str,
+) -> anyhow::Result<String> {
+    let user_messages = vec![ChatMessage::user(message)];
+
+    // Keep webhook/gateway prompts aligned with channel behavior by injecting
+    // workspace-aware system context before model invocation.
+    let system_prompt = {
+        let config_guard = state.config.lock();
+        crate::channels::build_system_prompt(
+            &config_guard.workspace_dir,
+            &state.model,
+            &[], // tools - empty for simple chat
+            &[], // skills
+            Some(&config_guard.identity),
+            None, // bootstrap_max_chars - use default
+        )
+    };
+
+    let mut messages = Vec::with_capacity(1 + user_messages.len());
+    messages.push(ChatMessage::system(system_prompt));
+    messages.extend(user_messages);
+
+    let multimodal_config = state.config.lock().multimodal.clone();
+    let prepared =
+        crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
+
+    state
+        .provider
+        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        .await
+}
+
+/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    crate::agent::process_message(config, message).await
 }
 
 /// Webhook request body
@@ -624,10 +780,10 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let client_key =
+    let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
-    if !state.rate_limiter.allow_webhook(&client_key) {
-        tracing::warn!("/webhook rate limit exceeded for key: {client_key}");
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/webhook rate limit exceeded");
         let err = serde_json::json!({
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
@@ -732,11 +888,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match state
-        .provider
-        .simple_chat(message, &state.model, state.temperature)
-        .await
-    {
+    match run_gateway_chat_simple(&state, &provider_label, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -747,6 +899,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
+                    input_tokens: None,
+                    output_tokens: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -776,6 +930,8 @@ async fn handle_webhook(
                     duration,
                     success: false,
                     error_message: Some(sanitized.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
                 });
             state.observer.record_metric(
                 &crate::observability::traits::ObserverMetric::RequestLatency(duration),
@@ -936,12 +1092,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        // Call the LLM
-        match state
-            .provider
-            .simple_chat(&msg.content, &state.model, state.temperature)
-            .await
-        {
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -967,6 +1118,223 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
+async fn handle_linq_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref linq) = state.linq else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Linq not configured"})),
+        );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+
+    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
+    if let Some(ref signing_secret) = state.linq_signing_secret {
+        let timestamp = headers
+            .get("X-Webhook-Timestamp")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let signature = headers
+            .get("X-Webhook-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::linq::verify_linq_signature(
+            signing_secret,
+            &body_str,
+            timestamp,
+            signature,
+        ) {
+            tracing::warn!(
+                "Linq webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from the webhook payload
+    let messages = linq.parse_webhook_payload(&payload);
+
+    if messages.is_empty() {
+        // Acknowledge the webhook even if no messages (could be status/delivery events)
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Process each message
+    for msg in &messages {
+        tracing::info!(
+            "Linq message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        // Auto-save to memory
+        if state.auto_save {
+            let key = linq_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        // Call the LLM
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
+            Ok(response) => {
+                // Send reply via Linq
+                if let Err(e) = linq
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Linq reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Linq message: {e:#}");
+                let _ = linq
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
+async fn handle_nextcloud_talk_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref nextcloud_talk) = state.nextcloud_talk else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Nextcloud Talk not configured"})),
+        );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+
+    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
+    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
+        let random = headers
+            .get("X-Nextcloud-Talk-Random")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let signature = headers
+            .get("X-Nextcloud-Talk-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
+            webhook_secret,
+            random,
+            &body_str,
+            signature,
+        ) {
+            tracing::warn!(
+                "Nextcloud Talk webhook signature verification failed (signature: {})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // Parse JSON body
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // Parse messages from webhook payload
+    let messages = nextcloud_talk.parse_webhook_payload(&payload);
+    if messages.is_empty() {
+        // Acknowledge webhook even if payload does not contain actionable user messages.
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    for msg in &messages {
+        tracing::info!(
+            "Nextcloud Talk message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+
+        if state.auto_save {
+            let key = nextcloud_talk_memory_key(msg);
+            let _ = state
+                .mem
+                .store(&key, &msg.content, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        match run_gateway_chat_with_tools(&state, &msg.content).await {
+            Ok(response) => {
+                if let Err(e) = nextcloud_talk
+                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                let _ = nextcloud_talk
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,6 +1347,12 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
+    fn generate_test_secret() -> String {
+        let bytes: [u8; 32] = rand::random();
+        hex::encode(bytes)
+    }
 
     #[test]
     fn security_body_limit_is_64kb() {
@@ -1034,6 +1408,10 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1075,6 +1453,10 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer,
         };
 
@@ -1221,8 +1603,8 @@ mod tests {
         assert_eq!(normalize_max_keys(1, 10_000), 1);
     }
 
-    #[test]
-    fn persist_pairing_tokens_writes_config_tokens() {
+    #[tokio::test]
+    async fn persist_pairing_tokens_writes_config_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         let workspace_path = temp.path().join("workspace");
@@ -1230,22 +1612,28 @@ mod tests {
         let mut config = Config::default();
         config.config_path = config_path.clone();
         config.workspace_dir = workspace_path;
-        config.save().unwrap();
+        config.save().await.unwrap();
 
         let guard = PairingGuard::new(true, &[]);
         let code = guard.pairing_code().unwrap();
-        let token = guard.try_pair(&code).unwrap().unwrap();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));
-        persist_pairing_tokens(&shared_config, &guard).unwrap();
+        persist_pairing_tokens(shared_config.clone(), &guard)
+            .await
+            .unwrap();
 
-        let saved = std::fs::read_to_string(config_path).unwrap();
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
         assert_eq!(parsed.gateway.paired_tokens.len(), 1);
         let persisted = &parsed.gateway.paired_tokens[0];
         assert_eq!(persisted.len(), 64);
         assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let in_memory = shared_config.lock();
+        assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
+        assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
     }
 
     #[test]
@@ -1267,6 +1655,7 @@ mod tests {
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,
+            thread_ts: None,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -1426,6 +1815,10 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1482,6 +1875,10 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1518,9 +1915,11 @@ mod tests {
 
     #[test]
     fn webhook_secret_hash_is_deterministic_and_nonempty() {
-        let one = hash_webhook_secret("secret-value");
-        let two = hash_webhook_secret("secret-value");
-        let other = hash_webhook_secret("other-value");
+        let secret_a = generate_test_secret();
+        let secret_b = generate_test_secret();
+        let one = hash_webhook_secret(&secret_a);
+        let two = hash_webhook_secret(&secret_a);
+        let other = hash_webhook_secret(&secret_b);
 
         assert_eq!(one, two);
         assert_ne!(one, other);
@@ -1532,6 +1931,7 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1540,13 +1940,17 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1570,6 +1974,8 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let valid_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1578,18 +1984,25 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("wrong-secret"));
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&wrong_secret).unwrap(),
+        );
 
         let response = handle_webhook(
             State(state),
@@ -1611,6 +2024,7 @@ mod tests {
         let provider_impl = Arc::new(MockProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
@@ -1619,18 +2033,22 @@ mod tests {
             temperature: 0.0,
             mem: memory,
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
+            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Webhook-Secret", HeaderValue::from_static("super-secret"));
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
 
         let response = handle_webhook(
             State(state),
@@ -1645,6 +2063,109 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let payload = format!("{random}{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+        };
+
+        let response = handle_nextcloud_talk_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"type":"message"}"#),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_invalid_signature() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            vec!["*".into()],
+        ));
+
+        let secret = "nextcloud-test-secret";
+        let random = "seed-value";
+        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
+        let invalid_signature = "deadbeef";
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: Some(channel),
+            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            observer: Arc::new(crate::observability::NoopObserver),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(invalid_signature).unwrap(),
+        );
+
+        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1666,14 +2187,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_valid() {
-        // Test with known values
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1681,14 +2201,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_secret() {
-        let app_secret = "correct_secret_key_abc";
-        let wrong_secret = "wrong_secret_key_xyz";
+        let app_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
         let body = b"test body content";
 
-        let signature_header = compute_whatsapp_signature_header(wrong_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1696,15 +2216,15 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_invalid_wrong_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let original_body = b"original body";
         let tampered_body = b"tampered body";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, original_body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
 
         // Verify with tampered body should fail
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             tampered_body,
             &signature_header
         ));
@@ -1712,14 +2232,14 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_missing_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Signature without "sha256=" prefix
         let signature_header = "abc123def456";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -1727,22 +2247,22 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_header() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        assert!(!verify_whatsapp_signature(app_secret, body, ""));
+        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
     }
 
     #[test]
     fn whatsapp_signature_invalid_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
         // Invalid hex characters
         let signature_header = "sha256=not_valid_hex_zzz";
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             signature_header
         ));
@@ -1750,13 +2270,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_empty_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"";
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1764,13 +2284,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_unicode_body() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = "Hello 🦀 World".as_bytes();
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1778,13 +2298,13 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_json_payload() {
-        let app_secret = "test_app_secret_key_xyz";
+        let app_secret = generate_test_secret();
         let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
 
-        let signature_header = compute_whatsapp_signature_header(app_secret, body);
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
 
         assert!(verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1792,31 +2312,35 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_case_sensitive_prefix() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
 
         // Wrong case prefix should fail
         let wrong_prefix = format!("SHA256={hex_sig}");
-        assert!(!verify_whatsapp_signature(app_secret, body, &wrong_prefix));
+        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(app_secret, body, &correct_prefix));
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &correct_prefix
+        ));
     }
 
     #[test]
     fn whatsapp_signature_truncated_hex() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let truncated = &hex_sig[..32]; // Only half the signature
         let signature_header = format!("sha256={truncated}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
@@ -1824,17 +2348,65 @@ mod tests {
 
     #[test]
     fn whatsapp_signature_extra_bytes() {
-        let app_secret = "test_secret_key_12345";
+        let app_secret = generate_test_secret();
         let body = b"test body";
 
-        let hex_sig = compute_whatsapp_signature_hex(app_secret, body);
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
         let extended = format!("{hex_sig}deadbeef");
         let signature_header = format!("sha256={extended}");
 
         assert!(!verify_whatsapp_signature(
-            app_secret,
+            &app_secret,
             body,
             &signature_header
         ));
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // IdempotencyStore Edge-Case Tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn idempotency_store_allows_different_keys() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 100);
+        assert!(store.record_if_new("key-a"));
+        assert!(store.record_if_new("key-b"));
+        assert!(store.record_if_new("key-c"));
+        assert!(store.record_if_new("key-d"));
+    }
+
+    #[test]
+    fn idempotency_store_max_keys_clamped_to_one() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 0);
+        assert!(store.record_if_new("only-key"));
+        assert!(!store.record_if_new("only-key"));
+    }
+
+    #[test]
+    fn idempotency_store_rapid_duplicate_rejected() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 100);
+        assert!(store.record_if_new("rapid"));
+        assert!(!store.record_if_new("rapid"));
+    }
+
+    #[test]
+    fn idempotency_store_accepts_after_ttl_expires() {
+        let store = IdempotencyStore::new(Duration::from_millis(1), 100);
+        assert!(store.record_if_new("ttl-key"));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.record_if_new("ttl-key"));
+    }
+
+    #[test]
+    fn idempotency_store_eviction_preserves_newest() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 1);
+        assert!(store.record_if_new("old-key"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("new-key"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 1);
+        assert!(!keys.contains_key("old-key"));
+        assert!(keys.contains_key("new-key"));
     }
 }

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
+use std::collections::HashMap;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -13,7 +14,7 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
-    typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl DiscordChannel {
@@ -30,7 +31,7 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             mention_only,
-            typing_handle: Mutex::new(None),
+            typing_handles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -50,6 +51,54 @@ impl DiscordChannel {
         let part = token.split('.').next()?;
         base64_decode(part)
     }
+}
+
+/// Process Discord message attachments and return a string to append to the
+/// agent message context.
+///
+/// Only `text/*` MIME types are fetched and inlined. All other types are
+/// silently skipped. Fetch errors are logged as warnings.
+async fn process_attachments(
+    attachments: &[serde_json::Value],
+    client: &reqwest::Client,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for att in attachments {
+        let ct = att
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = att
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
+            tracing::warn!(name, "discord: attachment has no url, skipping");
+            continue;
+        };
+        if ct.starts_with("text/") {
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(text) = resp.text().await {
+                        parts.push(format!("[{name}]\n{text}"));
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(name, status = %resp.status(), "discord attachment fetch failed");
+                }
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "discord attachment fetch error");
+                }
+            }
+        } else {
+            tracing::debug!(
+                name,
+                content_type = ct,
+                "discord: skipping unsupported attachment type"
+            );
+        }
+    }
+    parts.join("\n---\n")
 }
 
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -105,6 +154,23 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     }
 
     chunks
+}
+
+/// URL-encode a Unicode emoji for use in Discord reaction API paths.
+///
+/// Discord's reaction endpoints accept raw Unicode emoji in the URL path,
+/// but they must be percent-encoded per RFC 3986. Custom guild emojis use
+/// the `name:id` format and are passed through unencoded.
+fn encode_emoji_for_discord(emoji: &str) -> String {
+    if emoji.contains(':') {
+        return emoji.to_string();
+    }
+
+    let mut encoded = String::new();
+    for byte in emoji.as_bytes() {
+        encoded.push_str(&format!("%{byte:02X}"));
+    }
+    encoded
 }
 
 fn mention_tags(bot_user_id: &str) -> [String; 2] {
@@ -189,7 +255,8 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let chunks = split_message_for_discord(&message.content);
+        let content = super::strip_tool_call_tags(&message.content);
+        let chunks = split_message_for_discord(&content);
 
         for (i, chunk) in chunks.iter().enumerate() {
             let url = format!(
@@ -272,7 +339,9 @@ impl Channel for DiscordChannel {
                 }
             }
         });
-        write.send(Message::Text(identify.to_string())).await?;
+        write
+            .send(Message::Text(identify.to_string().into()))
+            .await?;
 
         tracing::info!("Discord: connected and identified");
 
@@ -301,7 +370,7 @@ impl Channel for DiscordChannel {
                 _ = hb_rx.recv() => {
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
-                    if write.send(Message::Text(hb.to_string())).await.is_err() {
+                    if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                         break;
                     }
                 }
@@ -312,7 +381,7 @@ impl Channel for DiscordChannel {
                         _ => continue,
                     };
 
-                    let event: serde_json::Value = match serde_json::from_str(&msg) {
+                    let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
@@ -329,7 +398,7 @@ impl Channel for DiscordChannel {
                         1 => {
                             let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                             let hb = json!({"op": 1, "d": d});
-                            if write.send(Message::Text(hb.to_string())).await.is_err() {
+                            if write.send(Message::Text(hb.to_string().into())).await.is_err() {
                                 break;
                             }
                             continue;
@@ -392,6 +461,20 @@ impl Channel for DiscordChannel {
                         continue;
                     };
 
+                    let attachment_text = {
+                        let atts = d
+                            .get("attachments")
+                            .and_then(|a| a.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        process_attachments(&atts, &self.http_client()).await
+                    };
+                    let final_content = if attachment_text.is_empty() {
+                        clean_content
+                    } else {
+                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+                    };
+
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
@@ -407,12 +490,13 @@ impl Channel for DiscordChannel {
                         } else {
                             channel_id.clone()
                         },
-                        content: clean_content,
+                        content: final_content,
                         channel: "discord".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        thread_ts: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -454,17 +538,80 @@ impl Channel for DiscordChannel {
             }
         });
 
-        let mut guard = self.typing_handle.lock();
-        *guard = Some(handle);
+        let mut guard = self.typing_handles.lock();
+        guard.insert(recipient.to_string(), handle);
 
         Ok(())
     }
 
-    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        let mut guard = self.typing_handle.lock();
-        if let Some(handle) = guard.take() {
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let mut guard = self.typing_handles.lock();
+        if let Some(handle) = guard.remove(recipient) {
             handle.abort();
         }
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let raw_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+        let encoded_emoji = encode_emoji_for_discord(emoji);
+        let url = format!(
+            "https://discord.com/api/v10/channels/{channel_id}/messages/{raw_id}/reactions/{encoded_emoji}/@me"
+        );
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .header("Content-Length", "0")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord add reaction failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let raw_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+        let encoded_emoji = encode_emoji_for_discord(emoji);
+        let url = format!(
+            "https://discord.com/api/v10/channels/{channel_id}/messages/{raw_id}/reactions/{encoded_emoji}/@me"
+        );
+
+        let resp = self
+            .http_client()
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord remove reaction failed ({status}): {err}");
+        }
+
         Ok(())
     }
 }
@@ -751,18 +898,18 @@ mod tests {
     }
 
     #[test]
-    fn typing_handle_starts_as_none() {
+    fn typing_handles_start_empty() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_none());
+        let guard = ch.typing_handles.lock();
+        assert!(guard.is_empty());
     }
 
     #[tokio::test]
     async fn start_typing_sets_handle() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("123456").await;
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_some());
+        let guard = ch.typing_handles.lock();
+        assert!(guard.contains_key("123456"));
     }
 
     #[tokio::test]
@@ -770,8 +917,8 @@ mod tests {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_none());
+        let guard = ch.typing_handles.lock();
+        assert!(!guard.contains_key("123456"));
     }
 
     #[tokio::test]
@@ -782,12 +929,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_typing_replaces_existing_task() {
+    async fn concurrent_typing_handles_are_independent() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_some());
+        {
+            let guard = ch.typing_handles.lock();
+            assert_eq!(guard.len(), 2);
+            assert!(guard.contains_key("111"));
+            assert!(guard.contains_key("222"));
+        }
+        // Stopping one does not affect the other
+        let _ = ch.stop_typing("111").await;
+        let guard = ch.typing_handles.lock();
+        assert_eq!(guard.len(), 1);
+        assert!(guard.contains_key("222"));
+    }
+
+    // ── Emoji encoding for reactions ──────────────────────────────
+
+    #[test]
+    fn encode_emoji_unicode_percent_encodes() {
+        let encoded = encode_emoji_for_discord("\u{1F440}");
+        assert_eq!(encoded, "%F0%9F%91%80");
+    }
+
+    #[test]
+    fn encode_emoji_checkmark() {
+        let encoded = encode_emoji_for_discord("\u{2705}");
+        assert_eq!(encoded, "%E2%9C%85");
+    }
+
+    #[test]
+    fn encode_emoji_custom_guild_emoji_passthrough() {
+        let encoded = encode_emoji_for_discord("custom_emoji:123456789");
+        assert_eq!(encoded, "custom_emoji:123456789");
+    }
+
+    #[test]
+    fn encode_emoji_simple_ascii_char() {
+        let encoded = encode_emoji_for_discord("A");
+        assert_eq!(encoded, "%41");
     }
 
     // ── Message ID edge cases ─────────────────────────────────────
@@ -839,5 +1021,135 @@ mod tests {
         assert!(id.starts_with("discord_"));
         // Should have UUID dashes
         assert!(id.contains('-'));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG6: Channel platform limit edge cases for Discord (2000 char limit)
+    // Prevents: Pattern 6 — issues #574, #499
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_message_code_block_at_boundary() {
+        // Code block that spans the split boundary
+        let mut msg = String::new();
+        msg.push_str("```rust\n");
+        msg.push_str(&"x".repeat(1990));
+        msg.push_str("\n```\nMore text after code block");
+        let parts = split_message_for_discord(&msg);
+        assert!(
+            parts.len() >= 2,
+            "code block spanning boundary should split"
+        );
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "each part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_single_long_word_exceeds_limit() {
+        // A single word longer than 2000 chars must be hard-split
+        let long_word = "a".repeat(2500);
+        let parts = split_message_for_discord(&long_word);
+        assert!(parts.len() >= 2, "word exceeding limit must be split");
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "hard-split part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+        // Reassembled content should match original
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled, long_word);
+    }
+
+    #[test]
+    fn split_message_exactly_at_limit_no_split() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH);
+        let parts = split_message_for_discord(&msg);
+        assert_eq!(parts.len(), 1, "message exactly at limit should not split");
+        assert_eq!(parts[0].len(), DISCORD_MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn split_message_one_over_limit_splits() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH + 1);
+        let parts = split_message_for_discord(&msg);
+        assert!(parts.len() >= 2, "message 1 char over limit must split");
+    }
+
+    #[test]
+    fn split_message_many_short_lines() {
+        // Many short lines should be batched into chunks under the limit
+        let msg: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "short-line batch must be <= limit"
+            );
+        }
+        // All content should be preserved
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled.trim(), msg.trim());
+    }
+
+    #[test]
+    fn split_message_only_whitespace() {
+        let msg = "   \n\n\t  ";
+        let parts = split_message_for_discord(msg);
+        // Should handle gracefully without panic
+        assert!(parts.len() <= 1);
+    }
+
+    #[test]
+    fn split_message_emoji_at_boundary() {
+        // Emoji are multi-byte; ensure we don't split mid-emoji
+        let mut msg = "a".repeat(1998);
+        msg.push_str("🎉🎊"); // 2 emoji at the boundary (2000 chars total)
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            // The function splits on character count, not byte count
+            assert!(
+                part.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "emoji boundary split must respect limit"
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_consecutive_newlines_at_boundary() {
+        let mut msg = "a".repeat(1995);
+        msg.push_str("\n\n\n\n\n");
+        msg.push_str(&"b".repeat(100));
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
+        }
+    }
+
+    // process_attachments tests
+
+    #[tokio::test]
+    async fn process_attachments_empty_list_returns_empty() {
+        let client = reqwest::Client::new();
+        let result = process_attachments(&[], &client).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_skips_unsupported_types() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/doc.pdf",
+            "filename": "doc.pdf",
+            "content_type": "application/pdf"
+        })];
+        let result = process_attachments(&attachments, &client).await;
+        assert!(result.is_empty());
     }
 }
