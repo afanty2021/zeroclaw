@@ -9,7 +9,11 @@
 </p>
 
 <p align="center">
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
+  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
+  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
+  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
   <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
   <a href="https://t.me/zeroclawlabs_cn"><img src="https://img.shields.io/badge/Telegram%20CN-%40zeroclawlabs__cn-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram CN: @zeroclawlabs_cn" /></a>
@@ -56,7 +60,7 @@
 
 ## 项目简介
 
-ZeroClaw 是一个高性能、低资源占用、可组合的自主智能体运行时：
+ZeroClaw 是一个高性能、低资源占用、可组合的自主智能体运行时。ZeroClaw 是面向智能代理工作流的**运行时操作系统** — 它抽象了模型、工具、记忆和执行层，使代理可以一次构建、随处运行。
 
 - Rust 原生实现，单二进制部署，跨 ARM / x86 / RISC-V。
 - Trait 驱动架构，`Provider` / `Channel` / `Tool` / `Memory` 可替换。
@@ -140,7 +144,7 @@ zeroclaw onboard --interactive
 # 单次对话
 zeroclaw agent -m "Hello, ZeroClaw!"
 
-# 启动网关（默认: 127.0.0.1:3000）
+# 启动网关（默认: 127.0.0.1:42617）
 zeroclaw gateway
 
 # 启动长期运行模式
@@ -249,7 +253,7 @@ keyword_weight = 0.3
 
 ## 安全默认行为（关键）
 
-- Gateway 默认绑定：`127.0.0.1:3000`
+- Gateway 默认绑定：`127.0.0.1:42617`
 - Gateway 默认要求配对：`require_pairing = true`
 - 默认拒绝公网绑定：`allow_public_bind = false`
 - Channel allowlist 语义：
@@ -271,7 +275,7 @@ embedding_provider = "none"    # none | openai | custom:https://...
 
 [gateway]
 host = "127.0.0.1"
-port = 3000
+port = 42617
 require_pairing = true
 allow_public_bind = false
 ```
@@ -295,7 +299,7 @@ allow_public_bind = false
 - 贡献指南：[`CONTRIBUTING.md`](CONTRIBUTING.md)
 - PR 工作流：[`docs/pr-workflow.md`](docs/pr-workflow.md)
 - Reviewer 指南：[`docs/reviewer-playbook.md`](docs/reviewer-playbook.md)
-- 许可证：MIT（见 [`LICENSE`](LICENSE) 与 [`NOTICE`](NOTICE)）
+- 许可证：MIT 或 Apache 2.0（见 [`LICENSE-MIT`](LICENSE-MIT)、[`LICENSE-APACHE`](LICENSE-APACHE) 与 [`NOTICE`](NOTICE)）
 
 ---
 

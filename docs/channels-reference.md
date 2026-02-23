@@ -93,7 +93,7 @@ cargo check --features hardware,channel-matrix
 cargo check --features hardware,channel-lark
 ```
 
-If `[channels_config.matrix]` or `[channels_config.lark]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
+If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
 
 ---
 
@@ -113,7 +113,8 @@ If `[channels_config.matrix]` or `[channels_config.lark]` is present but the cor
 | Webhook | gateway endpoint (`/webhook`) | Usually yes |
 | Email | IMAP polling + SMTP send | No |
 | IRC | IRC socket | No |
-| Lark/Feishu | websocket (default) or webhook | Webhook mode only |
+| Lark | websocket (default) or webhook | Webhook mode only |
+| Feishu | websocket (default) or webhook | Webhook mode only |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
@@ -132,7 +133,7 @@ For channels with inbound sender allowlists:
 
 Field names differ by channel:
 
-- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ/Nextcloud Talk)
+- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ/Nextcloud Talk)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
 - `allowed_senders` (Email/Linq)
@@ -177,9 +178,14 @@ mention_only = false
 [channels_config.slack]
 bot_token = "xoxb-..."
 app_token = "xapp-..."             # optional
-channel_id = "C1234567890"         # optional
+channel_id = "C1234567890"         # optional: single channel; omit or "*" for all accessible channels
 allowed_users = ["*"]
 ```
+
+Slack listen behavior:
+
+- `channel_id = "C123..."`: listen only on that channel.
+- `channel_id = "*"` or omitted: auto-discover and listen across all accessible channels.
 
 ### 4.4 Mattermost
 
@@ -296,7 +302,7 @@ sasl_password = ""                  # optional
 verify_tls = true
 ```
 
-### 4.11 Lark / Feishu
+### 4.11 Lark
 
 ```toml
 [channels_config.lark]
@@ -305,12 +311,29 @@ app_secret = "xxx"
 encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
-use_feishu = false
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```
 
-### 4.12 Nostr
+### 4.12 Feishu
+
+```toml
+[channels_config.feishu]
+app_id = "cli_xxx"
+app_secret = "xxx"
+encrypt_key = ""                    # optional
+verification_token = ""             # optional
+allowed_users = ["*"]
+receive_mode = "websocket"          # or "webhook"
+port = 8081                          # required for webhook mode
+```
+
+Migration note:
+
+- Legacy config `[channels_config.lark] use_feishu = true` is still supported for backward compatibility.
+- Prefer `[channels_config.feishu]` for new setups.
+
+### 4.13 Nostr
 
 ```toml
 [channels_config.nostr]
@@ -330,9 +353,8 @@ Interactive onboarding support:
 zeroclaw onboard --interactive
 ```
 
-The wizard now includes a dedicated **Lark/Feishu** step with:
+The wizard now includes dedicated **Lark** and **Feishu** steps with:
 
-- region selection (`Feishu (CN)` vs `Lark (International)`)
 - credential verification against official Open Platform auth endpoint
 - receive mode selection (`websocket` or `webhook`)
 - optional webhook verification token prompt (recommended for stronger callback authenticity checks)
@@ -343,7 +365,7 @@ Runtime token behavior:
 - send requests automatically retry once after token invalidation when Feishu/Lark returns either HTTP `401` or business error code `99991663` (`Invalid access token`).
 - if the retry still returns token-invalid responses, the send call fails with the upstream status/body for easier troubleshooting.
 
-### 4.13 DingTalk
+### 4.14 DingTalk
 
 ```toml
 [channels_config.dingtalk]
@@ -352,7 +374,7 @@ client_secret = "ding-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.14 QQ
+### 4.15 QQ
 
 ```toml
 [channels_config.qq]
@@ -361,7 +383,7 @@ app_secret = "qq-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.15 Nextcloud Talk
+### 4.16 Nextcloud Talk
 
 ```toml
 [channels_config.nextcloud_talk]
@@ -417,9 +439,9 @@ zeroclaw onboard --channels-only
 zeroclaw daemon
 ```
 
-3. Send a message from an expected sender.
-4. Confirm a reply arrives.
-5. Tighten allowlist from `"*"` to explicit IDs.
+1. Send a message from an expected sender.
+2. Confirm a reply arrives.
+3. Tighten allowlist from `"*"` to explicit IDs.
 
 ---
 
@@ -462,7 +484,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 |---|---|---|---|
 | Telegram | `Telegram channel listening for messages...` | `Telegram: ignoring message from unauthorized user:` | `Telegram poll error:` / `Telegram parse error:` / `Telegram polling conflict (409):` |
 | Discord | `Discord: connected and identified` | `Discord: ignoring message from unauthorized user:` | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)` |
-| Slack | `Slack channel listening on #` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` |
+| Slack | `Slack channel listening on #` / `Slack channel_id not set (or '*'); listening across all accessible channels.` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` / `Slack channel discovery failed:` |
 | Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
 | Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
 | Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |

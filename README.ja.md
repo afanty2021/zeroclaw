@@ -9,7 +9,11 @@
 </p>
 
 <p align="center">
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
+  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
+  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
+  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
   <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
   <a href="https://t.me/zeroclawlabs_cn"><img src="https://img.shields.io/badge/Telegram%20CN-%40zeroclawlabs__cn-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram CN: @zeroclawlabs_cn" /></a>
@@ -56,7 +60,7 @@
 
 ## 概要
 
-ZeroClaw は、高速・省リソース・高拡張性を重視した自律エージェント実行基盤です。
+ZeroClaw は、高速・省リソース・高拡張性を重視した自律エージェント実行基盤です。ZeroClawはエージェントワークフローのための**ランタイムオペレーティングシステム**です — モデル、ツール、メモリ、実行を抽象化し、エージェントを一度構築すればどこでも実行できるインフラストラクチャです。
 
 - Rust ネイティブ実装、単一バイナリで配布可能
 - Trait ベース設計（`Provider` / `Channel` / `Tool` / `Memory` など）
@@ -136,7 +140,7 @@ zeroclaw onboard --interactive
 
 zeroclaw agent -m "Hello, ZeroClaw!"
 
-# default: 127.0.0.1:3000
+# default: 127.0.0.1:42617
 zeroclaw gateway
 
 zeroclaw daemon
@@ -244,7 +248,7 @@ keyword_weight = 0.3
 
 ## セキュリティのデフォルト
 
-- Gateway の既定バインド: `127.0.0.1:3000`
+- Gateway の既定バインド: `127.0.0.1:42617`
 - 既定でペアリング必須: `require_pairing = true`
 - 既定で公開バインド禁止: `allow_public_bind = false`
 - Channel allowlist:
@@ -266,7 +270,7 @@ embedding_provider = "none"
 
 [gateway]
 host = "127.0.0.1"
-port = 3000
+port = 42617
 require_pairing = true
 allow_public_bind = false
 ```
@@ -290,7 +294,7 @@ allow_public_bind = false
 - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - PR Workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md)
 - Reviewer Playbook: [`docs/reviewer-playbook.md`](docs/reviewer-playbook.md)
-- License: MIT（[`LICENSE`](LICENSE), [`NOTICE`](NOTICE)）
+- License: MIT or Apache 2.0（[`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE), [`NOTICE`](NOTICE)）
 
 ---
 

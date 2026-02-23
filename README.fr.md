@@ -10,10 +10,11 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="Licence : MIT" /></a>
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="Licence : MIT ou Apache-2.0" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributeurs" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Offrez-moi un café" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X : @zeroclawlabs" /></a>
+  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
   <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu : Officiel" /></a>
   <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram : @zeroclawlabs" /></a>
   <a href="https://t.me/zeroclawlabs_cn"><img src="https://img.shields.io/badge/Telegram%20CN-%40zeroclawlabs__cn-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram CN : @zeroclawlabs_cn" /></a>
@@ -48,6 +49,10 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 <p align="center">
   <strong>Infrastructure d'assistant IA rapide, légère et entièrement autonome</strong><br />
   Déployez n'importe où. Échangez n'importe quoi.
+</p>
+
+<p align="center">
+  ZeroClaw est le <strong>système d'exploitation runtime</strong> pour les workflows agentiques — une infrastructure qui abstrait les modèles, outils, mémoire et exécution pour construire des agents une fois et les exécuter partout.
 </p>
 
 <p align="center"><code>Architecture pilotée par traits · runtime sécurisé par défaut · fournisseur/canal/outil interchangeables · tout est pluggable</code></p>
@@ -834,7 +839,7 @@ ZeroClaw est sous double licence pour une ouverture maximale et la protection de
 
 | Licence                      | Cas d'utilisation                                            |
 | ---------------------------- | ------------------------------------------------------------ |
-| [MIT](LICENSE)               | Open-source, recherche, académique, usage personnel          |
+| [MIT](LICENSE-MIT)               | Open-source, recherche, académique, usage personnel          |
 | [Apache 2.0](LICENSE-APACHE) | Protection de brevet, institutionnel, déploiement commercial |
 
 Vous pouvez choisir l'une ou l'autre licence. **Les contributeurs accordent automatiquement des droits sous les deux** — voir [CLA.md](CLA.md) pour l'accord de contributeur complet.

@@ -36,7 +36,7 @@ impl Tool for FileEditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
                 },
                 "old_string": {
                     "type": "string",
@@ -130,10 +130,10 @@ impl Tool for FileEditTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Resolved path escapes workspace: {}",
-                    resolved_parent.display()
-                )),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_parent),
+                ),
             });
         }
 
@@ -662,6 +662,27 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Failed to read file"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_blocks_null_byte_in_path() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_null_byte");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "test\0evil.txt",
+                "old_string": "old",
+                "new_string": "new"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("not allowed"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
