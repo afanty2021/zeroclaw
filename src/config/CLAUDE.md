@@ -8,6 +8,4 @@
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #4689 | 1:24 PM | 🔵 | Chinese communication platform integrations span 13 files across codebase and documentation | ~454 |
-| #4686 | 1:20 PM | ✅ | Documentation synchronization committed with upstream changes and postgres backend addition | ~357 |
-| #4637 | 10:52 AM | 🔵 | AGENTS.md and CLAUDE.md referenced in three source files | ~250 |
 </claude-mem-context>
