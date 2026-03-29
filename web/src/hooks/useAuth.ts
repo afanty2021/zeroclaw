@@ -25,6 +25,8 @@ export interface AuthState {
   token: string | null;
   /** Whether the user is currently authenticated. */
   isAuthenticated: boolean;
+  /** Whether the server requires pairing. Defaults to true (safe fallback). */
+  requiresPairing: boolean;
   /** True while the initial auth check is in progress. */
   loading: boolean;
   /** Pair with the agent using a pairing code. Stores the token on success. */
@@ -46,6 +48,7 @@ export interface AuthProviderProps {
 export function AuthProvider({ children }: AuthProviderProps) {
   const [token, setTokenState] = useState<string | null>(readToken);
   const [authenticated, setAuthenticated] = useState<boolean>(checkAuth);
+  const [requiresPairing, setRequiresPairing] = useState<boolean>(true);
   const [loading, setLoading] = useState<boolean>(!checkAuth());
 
   // On mount: check if server requires pairing at all
@@ -56,6 +59,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       .then((health) => {
         if (cancelled) return;
         if (!health.require_pairing) {
+          setRequiresPairing(false);
           setAuthenticated(true);
         }
       })
@@ -99,6 +103,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const value: AuthState = {
     token,
     isAuthenticated: authenticated,
+    requiresPairing,
     loading,
     pair,
     logout,

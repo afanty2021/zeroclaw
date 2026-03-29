@@ -1,7 +1,23 @@
 # CLAUDE.md — ZeroClaw Agent Engineering Protocol
 
-This file defines the default working protocol for Claude agents in this repository.
-Scope: entire repository.
+> **Shared instructions live in [`AGENTS.md`](./AGENTS.md).**
+> This file contains only Claude Code-specific directives.
+
+## Claude Code Settings
+
+Claude Code should read and follow all instructions in `AGENTS.md` at the repository root for project conventions, commands, risk tiers, workflow rules, and anti-patterns.
+
+## Hooks
+
+_No custom hooks defined yet._
+
+## Slash Commands
+
+_No custom slash commands defined yet._
+
+---
+
+# ZeroClaw Engineering Protocol
 
 ## 1) Project Snapshot (Read First)
 
@@ -67,7 +83,7 @@ Required:
 Required:
 
 - Do not add new config keys, trait methods, feature flags, or workflow branches without a concrete accepted use case.
-- Do not introduce speculative “future-proof” abstractions without at least one current caller.
+- Do not introduce speculative "future-proof" abstractions without at least one current caller.
 - Keep unsupported paths explicit (error out) rather than adding partial fake support.
 
 ### 3.3 DRY + Rule of Three
@@ -88,7 +104,7 @@ Required:
 
 - Keep each module focused on one concern.
 - Extend behavior by implementing existing narrow traits whenever possible.
-- Avoid fat interfaces and “god modules” that mix policy + transport + storage.
+- Avoid fat interfaces and "god modules" that mix policy + transport + storage.
 
 ### 3.5 Fail Fast + Explicit Errors
 
@@ -505,9 +521,9 @@ Reference docs:
 
 - Do not add heavy dependencies for minor convenience.
 - Do not silently weaken security policy or access constraints.
-- Do not add speculative config/feature flags “just in case”.
+- Do not add speculative config/feature flags "just in case".
 - Do not mix massive formatting-only changes with functional changes.
-- Do not modify unrelated modules “while here”.
+- Do not modify unrelated modules "while here".
 - Do not bypass failing checks without explicit explanation.
 - Do not hide behavior-changing side effects in refactor commits.
 - Do not include personal identity or sensitive information in test data, examples, docs, or commits.
@@ -531,5 +547,5 @@ When working in fast iterative mode:
 - Keep each iteration reversible (small commits, clear rollback).
 - Validate assumptions with code search before implementing.
 - Prefer deterministic behavior over clever shortcuts.
-- Do not “ship and hope” on security-sensitive paths.
+- Do not "ship and hope" on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.

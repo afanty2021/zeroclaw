@@ -1,71 +1,72 @@
+pub mod audit;
 pub mod backend;
 pub mod chunker;
 pub mod cli;
-pub mod cortex;
+pub mod conflict;
+pub mod consolidation;
 pub mod decay;
 pub mod embeddings;
-pub mod hybrid;
 pub mod hygiene;
+pub mod importance;
+pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
+pub mod namespaced;
 pub mod none;
-#[cfg(feature = "memory-postgres")]
-pub mod postgres;
+pub mod policy;
 pub mod qdrant;
 pub mod response_cache;
+pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
 pub mod vector;
 
+#[cfg(test)]
+mod battle_tests;
+
+#[allow(unused_imports)]
+pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
-    classify_memory_backend, default_memory_backend_key, memory_backend_profile,
-    selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
+    MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
+    memory_backend_profile, selectable_memory_backends,
 };
-pub use cortex::CortexMemMemory;
-pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
+pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
-#[cfg(feature = "memory-postgres")]
-pub use postgres::PostgresMemory;
+#[allow(unused_imports)]
+pub use policy::PolicyEnforcer;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
+#[allow(unused_imports)]
+pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{MemoryCategory, MemoryEntry};
+pub use traits::{ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
 
-fn create_memory_with_builders<F, G>(
+fn create_memory_with_builders<F>(
     backend_name: &str,
     workspace_dir: &Path,
     mut sqlite_builder: F,
-    mut postgres_builder: G,
     unknown_context: &str,
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
-    G: FnMut() -> anyhow::Result<Box<dyn Memory>>,
 {
     match classify_memory_backend(backend_name) {
-        MemoryBackendKind::Sqlite | MemoryBackendKind::SqliteQdrantHybrid => {
-            Ok(Box::new(sqlite_builder()?))
-        }
+        MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
-        MemoryBackendKind::CortexMem => {
-            let local = sqlite_builder()?;
-            Ok(Box::new(CortexMemMemory::new(workspace_dir, local)))
-        }
-        MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
@@ -100,6 +101,21 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
 }
 
+/// Filter known synthetic autosave noise patterns that should not be
+/// persisted as user conversation memories.
+pub fn should_skip_autosave_content(content: &str) -> bool {
+    let normalized = content.trim();
+    if normalized.is_empty() {
+        return true;
+    }
+
+    let lowered = normalized.to_ascii_lowercase();
+    lowered.starts_with("[cron:")
+        || lowered.starts_with("[heartbeat task")
+        || lowered.starts_with("[distilled_")
+        || lowered.contains("distilled_index_sig:")
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct ResolvedEmbeddingConfig {
     provider: String,
@@ -118,15 +134,36 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
+/// Look up the provider-specific environment variable for common embedding providers,
+/// so that `OPENAI_API_KEY` (etc.) takes precedence over the default-provider key
+/// that the caller passes in. Returns `None` for unknown providers.
+fn embedding_provider_env_key(provider: &str) -> Option<String> {
+    let env_var = match provider.trim() {
+        "openai" => "OPENAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "cohere" => "COHERE_API_KEY",
+        _ => return None,
+    };
+    std::env::var(env_var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
     api_key: Option<&str>,
 ) -> ResolvedEmbeddingConfig {
-    let fallback_api_key = api_key
+    let caller_api_key = api_key
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    // Prefer a provider-specific env var over the caller-supplied key, which
+    // may come from the default (chat) provider and differ from the embedding
+    // provider (issue #3083: gemini key leaking to openai embeddings endpoint).
+    let fallback_api_key =
+        embedding_provider_env_key(config.embedding_provider.trim()).or(caller_api_key);
     let fallback = ResolvedEmbeddingConfig {
         provider: config.embedding_provider.trim().to_string(),
         model: config.embedding_model.trim().to_string(),
@@ -221,10 +258,7 @@ pub fn create_memory_with_storage_and_routes(
         && config.snapshot_on_hygiene
         && matches!(
             backend_kind,
-            MemoryBackendKind::Sqlite
-                | MemoryBackendKind::SqliteQdrantHybrid
-                | MemoryBackendKind::Lucid
-                | MemoryBackendKind::CortexMem
+            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
         )
     {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
@@ -237,10 +271,7 @@ pub fn create_memory_with_storage_and_routes(
     if config.auto_hydrate
         && matches!(
             backend_kind,
-            MemoryBackendKind::Sqlite
-                | MemoryBackendKind::SqliteQdrantHybrid
-                | MemoryBackendKind::Lucid
-                | MemoryBackendKind::CortexMem
+            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
         )
         && snapshot::should_hydrate(workspace_dir)
     {
@@ -271,56 +302,19 @@ pub fn create_memory_with_storage_and_routes(
             ));
 
         #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_options(
+        let mem = SqliteMemory::with_embedder(
             workspace_dir,
             embedder,
             config.vector_weight as f32,
             config.keyword_weight as f32,
             config.embedding_cache_size,
             config.sqlite_open_timeout_secs,
-            &config.sqlite_journal_mode,
+            config.search_mode.clone(),
         )?;
         Ok(mem)
     }
 
-    #[cfg(feature = "memory-postgres")]
-    fn build_postgres_memory(
-        storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<Box<dyn Memory>> {
-        let storage_provider = storage_provider
-            .context("memory backend 'postgres' requires [storage.provider.config] settings")?;
-        let db_url = storage_provider
-            .db_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context(
-                "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
-            )?;
-
-        let memory = PostgresMemory::new(
-            db_url,
-            &storage_provider.schema,
-            &storage_provider.table,
-            storage_provider.connect_timeout_secs,
-            storage_provider.tls,
-        )?;
-        Ok(Box::new(memory))
-    }
-
-    #[cfg(not(feature = "memory-postgres"))]
-    fn build_postgres_memory(
-        _storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<Box<dyn Memory>> {
-        anyhow::bail!(
-            "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
-        );
-    }
-
-    fn build_qdrant_memory(
-        config: &MemoryConfig,
-        resolved_embedding: &ResolvedEmbeddingConfig,
-    ) -> anyhow::Result<QdrantMemory> {
+    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
         let url = config
             .qdrant
             .url
@@ -353,33 +347,18 @@ pub fn create_memory_with_storage_and_routes(
             url,
             collection
         );
-        Ok(QdrantMemory::new_lazy(
+        return Ok(Box::new(QdrantMemory::new_lazy(
             &url,
             &collection,
             qdrant_api_key,
             embedder,
-        ))
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
-        return Ok(Box::new(build_qdrant_memory(config, &resolved_embedding)?));
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::SqliteQdrantHybrid) {
-        let sqlite: Arc<dyn Memory> = Arc::new(build_sqlite_memory(
-            config,
-            workspace_dir,
-            &resolved_embedding,
-        )?);
-        let qdrant: Arc<dyn Memory> = Arc::new(build_qdrant_memory(config, &resolved_embedding)?);
-        return Ok(Box::new(SqliteQdrantHybridMemory::new(sqlite, qdrant)));
+        )));
     }
 
     create_memory_with_builders(
         &backend_name,
         workspace_dir,
         || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
-        || build_postgres_memory(storage_provider),
         "",
     )
 }
@@ -390,16 +369,7 @@ pub fn create_memory_for_migration(
 ) -> anyhow::Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
         anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, cortex-mem, or markdown before migration"
-        );
-    }
-
-    if matches!(
-        classify_memory_backend(backend),
-        MemoryBackendKind::Postgres
-    ) {
-        anyhow::bail!(
-            "memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first"
+            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
         );
     }
 
@@ -407,7 +377,6 @@ pub fn create_memory_for_migration(
         backend,
         workspace_dir,
         || SqliteMemory::new(workspace_dir),
-        || anyhow::bail!("postgres backend is not available in migration context"),
         " during migration",
     )
 }
@@ -465,6 +434,23 @@ mod tests {
     }
 
     #[test]
+    fn autosave_content_filter_drops_cron_and_distilled_noise() {
+        assert!(should_skip_autosave_content("[cron:auto] patrol check"));
+        assert!(should_skip_autosave_content(
+            "[DISTILLED_MEMORY_CHUNK 1/2] DISTILLED_INDEX_SIG:abc123"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Heartbeat Task | decision] Should I run tasks?"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Heartbeat Task | high] Execute scheduled patrol"
+        ));
+        assert!(!should_skip_autosave_content(
+            "User prefers concise answers."
+        ));
+    }
+
+    #[test]
     fn factory_markdown() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
@@ -484,32 +470,6 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "lucid");
-    }
-
-    #[test]
-    fn factory_cortex_mem() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "cortex-mem".into(),
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "cortex-mem");
-    }
-
-    #[test]
-    fn factory_sqlite_qdrant_hybrid() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "sqlite_qdrant_hybrid".into(),
-            qdrant: crate::config::QdrantConfig {
-                url: Some("http://localhost:6333".into()),
-                ..crate::config::QdrantConfig::default()
-            },
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "sqlite_qdrant_hybrid");
     }
 
     #[test]
@@ -542,13 +502,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_factory_cortex_mem() {
-        let tmp = TempDir::new().unwrap();
-        let mem = create_memory_for_migration("cortex-mem", tmp.path()).unwrap();
-        assert_eq!(mem.name(), "cortex-mem");
-    }
-
-    #[test]
     fn migration_factory_none_is_rejected() {
         let tmp = TempDir::new().unwrap();
         let error = create_memory_for_migration("none", tmp.path())
@@ -560,58 +513,14 @@ mod tests {
     #[test]
     fn effective_backend_name_prefers_storage_override() {
         let storage = StorageProviderConfig {
-            provider: "postgres".into(),
+            provider: "qdrant".into(),
             ..StorageProviderConfig::default()
         };
 
         assert_eq!(
             effective_memory_backend_name("sqlite", Some(&storage)),
-            "postgres"
+            "qdrant"
         );
-    }
-
-    #[test]
-    fn factory_postgres_without_db_url_is_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "postgres".into(),
-            ..MemoryConfig::default()
-        };
-
-        let storage = StorageProviderConfig {
-            provider: "postgres".into(),
-            db_url: None,
-            ..StorageProviderConfig::default()
-        };
-
-        let error = create_memory_with_storage(&cfg, Some(&storage), tmp.path(), None)
-            .err()
-            .expect("postgres without db_url should be rejected");
-        if cfg!(feature = "memory-postgres") {
-            assert!(error.to_string().contains("db_url"));
-        } else {
-            assert!(error.to_string().contains("memory-postgres"));
-        }
-    }
-
-    #[test]
-    fn factory_hybrid_requires_qdrant_url() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "sqlite_qdrant_hybrid".into(),
-            qdrant: crate::config::QdrantConfig {
-                url: None,
-                ..crate::config::QdrantConfig::default()
-            },
-            ..MemoryConfig::default()
-        };
-
-        let error = create_memory(&cfg, tmp.path(), None)
-            .err()
-            .expect("hybrid backend should require qdrant url");
-        assert!(error
-            .to_string()
-            .contains("Qdrant memory backend requires url"));
     }
 
     #[test]
@@ -709,6 +618,50 @@ mod tests {
                 dimensions: 1536,
                 api_key: Some("base-key".into()),
             }
+        );
+    }
+
+    // Regression guard for issue #3083: when default_provider is "gemini"
+    // (api_key = gemini key) but embedding_provider is "cohere", the
+    // embedding provider's own env var (COHERE_API_KEY) must take precedence
+    // over the caller-supplied key (which belongs to the default provider).
+    //
+    // Uses COHERE_API_KEY to avoid accidental collision with OPENAI_API_KEY
+    // that may be set in the developer environment.
+    #[test]
+    fn resolve_embedding_config_uses_embedding_provider_env_key_not_default_provider_key() {
+        // COHERE_API_KEY is almost certainly unset in normal dev environments.
+        let prev = std::env::var("COHERE_API_KEY").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("COHERE_API_KEY", "cohere-from-env") };
+
+        let cfg = MemoryConfig {
+            embedding_provider: "cohere".into(),
+            embedding_model: "embed-english-v3.0".into(),
+            embedding_dimensions: 1024,
+            ..MemoryConfig::default()
+        };
+
+        // Simulate: caller passes the Gemini (default_provider) api key.
+        let resolved = resolve_embedding_config(&cfg, &[], Some("gemini-key-must-not-be-used"));
+
+        // Restore env.
+        match prev {
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var("COHERE_API_KEY", v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var("COHERE_API_KEY") },
+        }
+
+        assert_eq!(
+            resolved.api_key.as_deref(),
+            Some("cohere-from-env"),
+            "embedding api_key must come from COHERE_API_KEY env var, not from the default provider key"
+        );
+        assert_ne!(
+            resolved.api_key.as_deref(),
+            Some("gemini-key-must-not-be-used"),
+            "default_provider key must not leak to the embedding provider"
         );
     }
 }

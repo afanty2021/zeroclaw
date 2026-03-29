@@ -1,104 +1,96 @@
 # Κέντρο Τεκμηρίωσης ZeroClaw
 
-Αυτή η σελίδα αποτελεί το κεντρικό σημείο πρόσβασης για το σύστημα τεκμηρίωσης του ZeroClaw.
+Αυτή η σελίδα είναι το κύριο σημείο εισόδου για το σύστημα τεκμηρίωσης.
 
-Τελευταία ενημέρωση: **21 Φεβρουαρίου 2026**.
+Τελευταία ενημέρωση: **20 Φεβρουαρίου 2026**.
 
-Τοπικοποιημένα κέντρα: [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · [Français](../fr/README.md) · [Tiếng Việt](../vi/README.md) · [Ελληνικά](README.md).
+Τοπικοποιημένα κέντρα: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md) · [Français](README.fr.md) · [Tiếng Việt](i18n/vi/README.md).
 
-## Γρήγορη Εκκίνηση
+## Ξεκινήστε Εδώ
 
-| Στόχος | Σύνδεσμος |
-|---|---|
-| Γρήγορη εγκατάσταση και εκτέλεση | [README.md (Πρώτα βήματα)](../README.md#quick-start) |
-| Αυτόματη προετοιμασία (Bootstrap) με μία εντολή | [one-click-bootstrap.md](one-click-bootstrap.md) |
-| Αναφορά εντολών ανά εργασία | [commands-reference.md](commands-reference.md) |
-| Έλεγχος προεπιλογών και παραμέτρων ρύθμισης | [config-reference.md](config-reference.md) |
-| Διαμόρφωση προσαρμοσμένων παρόχων και άκρων (endpoints) | [custom-providers.md](custom-providers.md) |
-| Ρύθμιση παρόχου Z.AI / GLM | [zai-glm-setup.md](zai-glm-setup.md) |
-| Χρήση προτύπων ενσωμάτωσης LangGraph | [langgraph-integration.md](langgraph-integration.md) |
-| Ρύθμιση Nextcloud Talk | [nextcloud-talk-setup.md](nextcloud-talk-setup.md) |
-| Ασφαλής διαχείριση proxy scopes | [proxy-agent-playbook.md](proxy-agent-playbook.md) |
-| Διαχείριση περιβάλλοντος εκτέλεσης (Day-2 Runbook) | [operations-runbook.md](operations-runbook.md) |
-| Λειτουργία probes συνδεσιμότητας provider στο CI | [operations/connectivity-probes-runbook.md](operations/connectivity-probes-runbook.md) |
-| Αντιμετώπιση προβλημάτων εγκατάστασης και καναλιών | [troubleshooting.md](troubleshooting.md) |
-| Οδηγός κρυπτογραφημένων δωματίων Matrix | [matrix-e2ee-guide.md](matrix-e2ee-guide.md) |
-| Περιήγηση στα έγγραφα ανά κατηγορία | [SUMMARY.md](SUMMARY.md) |
-| Στιγμιότυπο διαχείρισης έργου (PR/Issues) | [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md) |
+| Θέλω να…                                                            | Διαβάστε αυτό                                                                  |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Εγκαταστήσω και εκτελέσω το ZeroClaw γρήγορα                       | [README.md (Γρήγορη Εκκίνηση)](../README.md#quick-start)                      |
+| Εκκίνηση με μία εντολή                                              | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)                  |
+| Βρω εντολές ανά εργασία                                             | [commands-reference.md](reference/cli/commands-reference.md)                   |
+| Ελέγξω γρήγορα κλειδιά και προεπιλογές ρυθμίσεων                   | [config-reference.md](reference/api/config-reference.md)                       |
+| Ρυθμίσω προσαρμοσμένους παρόχους/endpoints                         | [custom-providers.md](contributing/custom-providers.md)                        |
+| Ρυθμίσω τον πάροχο Z.AI / GLM                                      | [zai-glm-setup.md](setup-guides/zai-glm-setup.md)                             |
+| Χρησιμοποιήσω τα πρότυπα ενσωμάτωσης LangGraph                     | [langgraph-integration.md](contributing/langgraph-integration.md)              |
+| Λειτουργήσω το runtime (runbook ημέρας-2)                           | [operations-runbook.md](ops/operations-runbook.md)                             |
+| Αντιμετωπίσω προβλήματα εγκατάστασης/runtime/καναλιού               | [troubleshooting.md](ops/troubleshooting.md)                                   |
+| Εκτελέσω ρύθμιση και διαγνωστικά κρυπτογραφημένων δωματίων Matrix  | [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md)                          |
+| Περιηγηθώ στα έγγραφα ανά κατηγορία                                 | [SUMMARY.md](SUMMARY.md)                                                      |
+| Δω το στιγμιότυπο εγγράφων PR/issues του έργου                     | [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md) |
 
-## Οδηγός Γρήγορης Επιλογής
+## Δέντρο Γρήγορης Απόφασης (10 δευτερόλεπτα)
 
-- Εγκατάσταση και πρώτα βήματα → [getting-started/README.md](getting-started/README.md)
-- Τεχνική αναφορά CLI και παραμέτρων → [reference/README.md](reference/README.md)
-- Λειτουργία και διαχείριση υπηρεσιών → [operations/README.md](operations/README.md)
-- Αντιμετώπιση σφαλμάτων και προβλημάτων → [troubleshooting.md](troubleshooting.md)
-- Ασφάλεια και οδικός χάρτης ανάπτυξης → [security/README.md](security/README.md)
-- Yλικό και περιφερειακές συσκευές → [hardware/README.md](hardware/README.md)
-- Συνεισφορά και διαδικασίες CI → [contributing/README.md](contributing/README.md)
-- Πλήρης πίνακας περιεχομένων → [SUMMARY.md](SUMMARY.md)
+- Χρειάζεστε αρχική ρύθμιση ή εγκατάσταση; → [setup-guides/README.md](setup-guides/README.md)
+- Χρειάζεστε ακριβή κλειδιά CLI/ρυθμίσεων; → [reference/README.md](reference/README.md)
+- Χρειάζεστε λειτουργίες παραγωγής/υπηρεσίας; → [ops/README.md](ops/README.md)
+- Βλέπετε αποτυχίες ή παλινδρομήσεις; → [troubleshooting.md](ops/troubleshooting.md)
+- Εργάζεστε στη σκλήρυνση ασφαλείας ή τον οδικό χάρτη; → [security/README.md](security/README.md)
+- Εργάζεστε με πλακέτες/περιφερειακά; → [hardware/README.md](hardware/README.md)
+- Συνεισφορά/αξιολόγηση/ροή εργασίας CI; → [contributing/README.md](contributing/README.md)
+- Θέλετε τον πλήρη χάρτη; → [SUMMARY.md](SUMMARY.md)
 
-## Κατηγορίες Τεκμηρίωσης
+## Συλλογές (Συνιστώνται)
 
-- **Πρώτα βήματα**: [getting-started/README.md](getting-started/README.md)
-- **Αναφορές (References)**: [reference/README.md](reference/README.md)
-- **Λειτουργίες**: [operations/README.md](operations/README.md)
-- **Ασφάλεια**: [security/README.md](security/README.md)
-- **Υλικό**: [hardware/README.md](hardware/README.md)
-- **Συνεισφορά**: [contributing/README.md](contributing/README.md)
-- **Έργο (Project)**: [project/README.md](project/README.md)
+- Εκκίνηση: [setup-guides/README.md](setup-guides/README.md)
+- Κατάλογοι αναφοράς: [reference/README.md](reference/README.md)
+- Λειτουργίες & ανάπτυξη: [ops/README.md](ops/README.md)
+- Έγγραφα ασφαλείας: [security/README.md](security/README.md)
+- Υλικό/περιφερειακά: [hardware/README.md](hardware/README.md)
+- Συνεισφορά/CI: [contributing/README.md](contributing/README.md)
+- Στιγμιότυπα έργου: [maintainers/README.md](maintainers/README.md)
 
-## Ανάλογα με τον Ρόλο
+## Ανά Κοινό
 
-### Χρήστες και Διαχειριστές (Operators)
+### Χρήστες / Χειριστές
 
-- [commands-reference.md](commands-reference.md) — Αναζήτηση εντολών ανά ροή εργασίας.
-- [providers-reference.md](providers-reference.md) — Αναγνωριστικά παρόχων και μεταβλητές περιβάλλοντος.
-- [channels-reference.md](channels-reference.md) — Ρύθμιση καναλιών επικοινωνίας.
-- [matrix-e2ee-guide.md](matrix-e2ee-guide.md) — Κρυπτογράφηση Matrix και επίλυση προβλημάτων.
-- [config-reference.md](config-reference.md) — Παράμετροι ρύθμισης και προεπιλογές ασφαλείας.
-- [custom-providers.md](custom-providers.md) — Ενσωμάτωση προσαρμοσμένων παρόχων.
-- [zai-glm-setup.md](zai-glm-setup.md) — Ρύθμιση Z.AI/GLM και πίνακας άκρων.
-- [langgraph-integration.md](langgraph-integration.md) — Εναλλακτική ενσωμάτωση για κλήσεις εργαλείων.
-- [operations-runbook.md](operations-runbook.md) — Διαδικασίες Day-2 και στρατηγικές επαναφοράς.
-- [troubleshooting.md](troubleshooting.md) — Αντιμετώπιση κοινών σφαλμάτων.
+- [commands-reference.md](reference/cli/commands-reference.md) — αναζήτηση εντολών ανά ροή εργασίας
+- [providers-reference.md](reference/api/providers-reference.md) — αναγνωριστικά παρόχων, ψευδώνυμα, μεταβλητές περιβάλλοντος διαπιστευτηρίων
+- [channels-reference.md](reference/api/channels-reference.md) — δυνατότητες καναλιών και διαδρομές ρύθμισης
+- [matrix-e2ee-guide.md](security/matrix-e2ee-guide.md) — ρύθμιση κρυπτογραφημένων δωματίων Matrix (E2EE) και διαγνωστικά μη-απόκρισης
+- [config-reference.md](reference/api/config-reference.md) — κλειδιά ρυθμίσεων υψηλής σήμανσης και ασφαλείς προεπιλογές
+- [custom-providers.md](contributing/custom-providers.md) — πρότυπα ενσωμάτωσης προσαρμοσμένου παρόχου/βασικού URL
+- [zai-glm-setup.md](setup-guides/zai-glm-setup.md) — ρύθμιση Z.AI/GLM και πίνακας endpoints
+- [langgraph-integration.md](contributing/langgraph-integration.md) — εφεδρική ενσωμάτωση για ακραίες περιπτώσεις μοντέλου/κλήσης εργαλείου
+- [operations-runbook.md](ops/operations-runbook.md) — λειτουργίες runtime ημέρας-2 και ροές επαναφοράς
+- [troubleshooting.md](ops/troubleshooting.md) — συνήθεις υπογραφές αποτυχίας και βήματα αποκατάστασης
 
-### Συνεισφέροντες και Συντηρητές (Maintainers)
+### Συνεισφέροντες / Συντηρητές
 
-- [../../../CONTRIBUTING.el.md](../../../CONTRIBUTING.el.md) — Οδηγός συνεισφοράς.
-- [pr-workflow.md](pr-workflow.md) — Διαδικασία υποβολής Pull Requests.
-- [reviewer-playbook.md](reviewer-playbook.md) — Οδηγός για αναθεωρητές κώδικα.
-- [ci-map.md](ci-map.md) — Διάγραμμα διαδικασιών CI.
-- [actions-source-policy.md](actions-source-policy.md) — Πολιτική χρήσης GitHub Actions.
+- [../CONTRIBUTING.md](../CONTRIBUTING.md)
+- [pr-workflow.md](contributing/pr-workflow.md)
+- [reviewer-playbook.md](contributing/reviewer-playbook.md)
+- [ci-map.md](contributing/ci-map.md)
+- [actions-source-policy.md](contributing/actions-source-policy.md)
 
-### Ασφάλεια και Αξιοπιστία
+### Ασφάλεια / Αξιοπιστία
 
-> **Σημείωση**: Αυτή η ενότητα περιλαμβάνει προτάσεις και οδικούς χάρτες. Για την τρέχουσα λειτουργία, συμβουλευτείτε τα [config-reference.md](config-reference.md) και [operations-runbook.md](operations-runbook.md).
+> Σημείωση: αυτή η περιοχή περιλαμβάνει έγγραφα πρότασης/οδικού χάρτη. Για την τρέχουσα συμπεριφορά, ξεκινήστε από [config-reference.md](reference/api/config-reference.md), [operations-runbook.md](ops/operations-runbook.md), και [troubleshooting.md](ops/troubleshooting.md).
 
 - [security/README.md](security/README.md)
-- [agnostic-security.md](agnostic-security.md)
-- [frictionless-security.md](frictionless-security.md)
-- [sandboxing.md](sandboxing.md)
-- [audit-logging.md](audit-logging.md)
-- [resource-limits.md](resource-limits.md)
-- [security-roadmap.md](security-roadmap.md)
+- [agnostic-security.md](security/agnostic-security.md)
+- [frictionless-security.md](security/frictionless-security.md)
+- [sandboxing.md](security/sandboxing.md)
+- [audit-logging.md](security/audit-logging.md)
+- [resource-limits.md](ops/resource-limits.md)
+- [security-roadmap.md](security/security-roadmap.md)
 
-## Διακυβέρνηση και Πλοήγηση
+## Πλοήγηση Συστήματος & Διακυβέρνηση
 
-- Πλήρης πίνακας περιεχομένων: [SUMMARY.md](SUMMARY.md)
-- Κατάλογος και ταξινόμηση εγγράφων: [docs-inventory.md](docs-inventory.md)
-- Ευρετήριο μεταφράσεων i18n: [../README.md](../README.md)
-- Κατάσταση κάλυψης i18n: [../../i18n-coverage.md](../../i18n-coverage.md)
-- Οδηγός ολοκλήρωσης i18n: [i18n-guide.md](i18n-guide.md)
-- Χάρτης κάλυψης i18n (Ελληνικά): [i18n-coverage.md](i18n-coverage.md)
-- Backlog κενών i18n: [i18n-gap-backlog.md](i18n-gap-backlog.md)
-- Snapshot ελέγχου τεκμηρίωσης (2026-02-24): [docs-audit-2026-02-24.md](docs-audit-2026-02-24.md)
-- Στιγμιότυπο διαχείρισης έργου: [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
+- Ενοποιημένος πίνακας περιεχομένων: [SUMMARY.md](SUMMARY.md)
+- Χάρτης δομής εγγράφων (γλώσσα/τμήμα/λειτουργία): [structure/README.md](maintainers/structure-README.md)
+- Απογραφή/ταξινόμηση τεκμηρίωσης: [docs-inventory.md](maintainers/docs-inventory.md)
+- Στιγμιότυπο διαλογής έργου: [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md)
 
 ## Άλλες γλώσσες
 
-- English: [../../README.md](../../README.md)
-- 简体中文: [../zh-CN/README.md](../zh-CN/README.md)
-- 日本語: [../ja/README.md](../ja/README.md)
-- Русский: [../ru/README.md](../ru/README.md)
-- Français: [../fr/README.md](../fr/README.md)
-- Tiếng Việt: [../vi/README.md](../vi/README.md)
+- English: [README.md](README.md)
+- 简体中文: [README.zh-CN.md](README.zh-CN.md)
+- 日本語: [README.ja.md](README.ja.md)
+- Русский: [README.ru.md](README.ru.md)
+- Français: [README.fr.md](README.fr.md)
+- Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)

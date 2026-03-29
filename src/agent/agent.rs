@@ -1,12 +1,10 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
-use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
-use crate::agent::loop_::history::{extract_facts_from_turns, TurnBuffer};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::agent::research;
-use crate::config::{Config, ResearchPhaseConfig};
+use crate::config::Config;
+use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
@@ -14,12 +12,30 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
+use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 
-const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+/// Events emitted during a streamed agent turn.
+///
+/// Consumers receive these through a `tokio::sync::mpsc::Sender<TurnEvent>`
+/// passed to [`Agent::turn_streamed`].
+#[derive(Debug, Clone)]
+pub enum TurnEvent {
+    /// A text chunk from the LLM response (may arrive many times).
+    Chunk { delta: String },
+    /// A reasoning/thinking chunk from a thinking model (may arrive many times).
+    Thinking { delta: String },
+    /// The agent is invoking a tool.
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    /// A tool has returned a result.
+    ToolResult { name: String, output: String },
+}
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -38,13 +54,23 @@ pub struct Agent {
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     auto_save: bool,
-    session_id: Option<String>,
-    turn_buffer: TurnBuffer,
+    memory_session_id: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
-    research_config: ResearchPhaseConfig,
+    allowed_tools: Option<Vec<String>>,
+    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    tool_descriptions: Option<ToolDescriptions>,
+    /// Pre-rendered security policy summary injected into the system prompt
+    /// so the LLM knows the concrete constraints before making tool calls.
+    security_summary: Option<String>,
+    /// Autonomy level from config; controls safety prompt instructions.
+    autonomy_level: crate::security::AutonomyLevel,
+    /// Activated MCP tools for deferred loading mode.
+    /// When MCP deferred loading is enabled, tools are activated via `tool_search`
+    /// and stored here for lookup during tool execution.
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 }
 
 pub struct AgentBuilder {
@@ -63,11 +89,16 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
-    session_id: Option<String>,
+    memory_session_id: Option<String>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
-    research_config: Option<ResearchPhaseConfig>,
+    allowed_tools: Option<Vec<String>>,
+    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    tool_descriptions: Option<ToolDescriptions>,
+    security_summary: Option<String>,
+    autonomy_level: Option<crate::security::AutonomyLevel>,
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 }
 
 impl AgentBuilder {
@@ -88,11 +119,16 @@ impl AgentBuilder {
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
-            session_id: None,
+            memory_session_id: None,
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
-            research_config: None,
+            allowed_tools: None,
+            response_cache: None,
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: None,
+            activated_tools: None,
         }
     }
 
@@ -174,9 +210,8 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the session identifier for memory isolation across users/channels.
-    pub fn session_id(mut self, session_id: String) -> Self {
-        self.session_id = Some(session_id);
+    pub fn memory_session_id(mut self, memory_session_id: Option<String>) -> Self {
+        self.memory_session_id = memory_session_id;
         self
     }
 
@@ -198,15 +233,50 @@ impl AgentBuilder {
         self
     }
 
-    pub fn research_config(mut self, research_config: ResearchPhaseConfig) -> Self {
-        self.research_config = Some(research_config);
+    pub fn allowed_tools(mut self, allowed_tools: Option<Vec<String>>) -> Self {
+        self.allowed_tools = allowed_tools;
+        self
+    }
+
+    pub fn response_cache(
+        mut self,
+        cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
+    ) -> Self {
+        self.response_cache = cache;
+        self
+    }
+
+    pub fn tool_descriptions(mut self, tool_descriptions: Option<ToolDescriptions>) -> Self {
+        self.tool_descriptions = tool_descriptions;
+        self
+    }
+
+    pub fn security_summary(mut self, summary: Option<String>) -> Self {
+        self.security_summary = summary;
+        self
+    }
+
+    pub fn autonomy_level(mut self, level: crate::security::AutonomyLevel) -> Self {
+        self.autonomy_level = Some(level);
+        self
+    }
+
+    pub fn activated_tools(
+        mut self,
+        activated: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>>,
+    ) -> Self {
+        self.activated_tools = activated;
         self
     }
 
     pub fn build(self) -> Result<Agent> {
-        let tools = self
+        let mut tools = self
             .tools
             .ok_or_else(|| anyhow::anyhow!("tools are required"))?;
+        let allowed = self.allowed_tools.clone();
+        if let Some(ref allow_list) = allowed {
+            tools.retain(|t| allow_list.iter().any(|name| name == t.name()));
+        }
         let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
 
         Ok(Agent {
@@ -231,7 +301,9 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
-            model_name: crate::config::resolve_default_model_id(self.model_name.as_deref(), None),
+            model_name: self
+                .model_name
+                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -240,13 +312,19 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
-            session_id: self.session_id,
-            turn_buffer: TurnBuffer::new(),
+            memory_session_id: self.memory_session_id,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
-            research_config: self.research_config.unwrap_or_default(),
+            allowed_tools: allowed,
+            response_cache: self.response_cache,
+            tool_descriptions: self.tool_descriptions,
+            security_summary: self.security_summary,
+            autonomy_level: self
+                .autonomy_level
+                .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            activated_tools: self.activated_tools,
         })
     }
 }
@@ -254,10 +332,6 @@ impl AgentBuilder {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
-    }
-
-    pub fn tool_specs(&self) -> &[ToolSpec] {
-        &self.tool_specs
     }
 
     pub fn history(&self) -> &[ConversationMessage] {
@@ -268,11 +342,30 @@ impl Agent {
         self.history.clear();
     }
 
-    pub fn from_config(config: &Config) -> Result<Self> {
-        if let Err(error) = crate::plugins::runtime::initialize_from_config(&config.plugins) {
-            tracing::warn!("plugin registry initialization skipped: {error}");
-        }
+    pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
+        self.memory_session_id = session_id;
+    }
 
+    /// Hydrate the agent with prior chat messages (e.g. from a session backend).
+    ///
+    /// Ensures a system prompt is prepended if history is empty, then appends all
+    /// non-system messages from the seed. System messages in the seed are skipped
+    /// to avoid duplicating the system prompt.
+    pub fn seed_history(&mut self, messages: &[ChatMessage]) {
+        if self.history.is_empty() {
+            if let Ok(sys) = self.build_system_prompt() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::system(sys)));
+            }
+        }
+        for msg in messages {
+            if msg.role != "system" {
+                self.history.push(ConversationMessage::Chat(msg.clone()));
+            }
+        }
+    }
+
+    pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -301,7 +394,14 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let (
+            mut tools,
+            delegate_handle,
+            _reaction_handle,
+            _channel_map_handle,
+            _ask_user_handle,
+            _escalate_handle,
+        ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -315,52 +415,88 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None,
         );
-        let (tools, tool_filter_report) = tools::filter_primary_agent_tools(
-            tools,
-            &config.agent.allowed_tools,
-            &config.agent.denied_tools,
-        );
-        for unmatched in tool_filter_report.unmatched_allowed_tools {
-            tracing::debug!(
-                tool = %unmatched,
-                "agent.allowed_tools entry did not match any registered tool"
+
+        // ── Wire MCP tools (non-fatal) ─────────────────────────────
+        // Replicates the same MCP initialization logic used in the CLI
+        // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
+        // path also has access to MCP tools.
+        let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
+        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+            tracing::info!(
+                "Initializing MCP client — {} server(s) configured",
+                config.mcp.servers.len()
             );
-        }
-        let has_agent_allowlist = config
-            .agent
-            .allowed_tools
-            .iter()
-            .any(|entry| !entry.trim().is_empty());
-        let has_agent_denylist = config
-            .agent
-            .denied_tools
-            .iter()
-            .any(|entry| !entry.trim().is_empty());
-        if has_agent_allowlist
-            && has_agent_denylist
-            && tool_filter_report.allowlist_match_count > 0
-            && tools.is_empty()
-        {
-            anyhow::bail!(
-                "agent.allowed_tools and agent.denied_tools removed all executable tools; update [agent] tool filters"
-            );
+            match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+                Ok(registry) => {
+                    let registry = std::sync::Arc::new(registry);
+                    if config.mcp.deferred_loading {
+                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
+                            std::sync::Arc::clone(&registry),
+                        )
+                        .await;
+                        tracing::info!(
+                            "MCP deferred: {} tool stub(s) from {} server(s)",
+                            deferred_set.len(),
+                            registry.server_count()
+                        );
+                        let activated =
+                            Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
+                        activated_tools = Some(Arc::clone(&activated));
+                        tools.push(Box::new(tools::ToolSearchTool::new(
+                            deferred_set,
+                            activated,
+                        )));
+                    } else {
+                        let names = registry.tool_names();
+                        let mut registered = 0usize;
+                        for name in names {
+                            if let Some(def) = registry.get_tool_def(&name).await {
+                                let wrapper: std::sync::Arc<dyn tools::Tool> =
+                                    std::sync::Arc::new(tools::McpToolWrapper::new(
+                                        name,
+                                        def,
+                                        std::sync::Arc::clone(&registry),
+                                    ));
+                                if let Some(ref handle) = delegate_handle {
+                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                }
+                                tools.push(Box::new(tools::ArcToolRef(wrapper)));
+                                registered += 1;
+                            }
+                        }
+                        tracing::info!(
+                            "MCP: {} tool(s) registered from {} server(s)",
+                            registered,
+                            registry.server_count()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("MCP registry failed to initialize: {e:#}");
+                }
+            }
         }
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
-        let model_name = crate::config::resolve_default_model_id(
-            config.default_model.as_deref(),
-            Some(provider_name),
-        );
+        let model_name = config
+            .default_model
+            .as_deref()
+            .unwrap_or("anthropic/claude-sonnet-4-20250514")
+            .to_string();
 
-        let provider: Box<dyn Provider> = providers::create_routed_provider(
+        let provider_runtime_options = providers::provider_runtime_options_from_config(config);
+
+        let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
             provider_name,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
             &config.model_routes,
             &model_name,
+            &provider_runtime_options,
         )?;
 
         let dispatcher_choice = config.agent.tool_dispatcher.as_str();
@@ -378,11 +514,25 @@ impl Agent {
             .collect();
         let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
 
+        let response_cache = if config.memory.response_cache_enabled {
+            crate::memory::response_cache::ResponseCache::with_hot_cache(
+                &config.workspace_dir,
+                config.memory.response_cache_ttl_minutes,
+                config.memory.response_cache_max_entries,
+                config.memory.response_cache_hot_entries,
+            )
+            .ok()
+            .map(Arc::new)
+        } else {
+            None
+        };
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
             .observer(observer)
+            .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
             .memory_loader(Box::new(DefaultMemoryLoader::new(
                 5,
@@ -403,7 +553,9 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
-            .research_config(config.research.clone())
+            .security_summary(Some(security.prompt_summary()))
+            .autonomy_level(config.autonomy.level)
+            .activated_tools(activated_tools)
             .build()
     }
 
@@ -444,6 +596,9 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
+            tool_descriptions: self.tool_descriptions.as_ref(),
+            security_summary: self.security_summary.clone(),
+            autonomy_level: self.autonomy_level,
         };
         self.prompt_builder.build(&ctx)
     }
@@ -451,8 +606,34 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        let (result, success) =
-            if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
+        // First try to find tool in static registry, then in activated MCP tools.
+        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
+            match tool.execute(call.arguments.clone()).await {
+                Ok(r) => {
+                    self.observer.record_event(&ObserverEvent::ToolCall {
+                        tool: call.name.clone(),
+                        duration: start.elapsed(),
+                        success: r.success,
+                    });
+                    if r.success {
+                        r.output
+                    } else {
+                        format!("Error: {}", r.error.unwrap_or(r.output))
+                    }
+                }
+                Err(e) => {
+                    self.observer.record_event(&ObserverEvent::ToolCall {
+                        tool: call.name.clone(),
+                        duration: start.elapsed(),
+                        success: false,
+                    });
+                    format!("Error executing {}: {e}", call.name)
+                }
+            }
+        } else if let Some(activated_arc) = self.activated_tools.as_ref() {
+            // Try to find in activated MCP tools.
+            let activated_opt = activated_arc.lock().unwrap().get_resolved(&call.name);
+            if let Some(tool) = activated_opt {
                 match tool.execute(call.arguments.clone()).await {
                     Ok(r) => {
                         self.observer.record_event(&ObserverEvent::ToolCall {
@@ -461,9 +642,9 @@ impl Agent {
                             success: r.success,
                         });
                         if r.success {
-                            (r.output, true)
+                            r.output
                         } else {
-                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                            format!("Error: {}", r.error.unwrap_or(r.output))
                         }
                     }
                     Err(e) => {
@@ -472,17 +653,20 @@ impl Agent {
                             duration: start.elapsed(),
                             success: false,
                         });
-                        (format!("Error executing {}: {e}", call.name), false)
+                        format!("Error executing {}: {e}", call.name)
                     }
                 }
             } else {
-                (format!("Unknown tool: {}", call.name), false)
-            };
+                format!("Unknown tool: {}", call.name)
+            }
+        } else {
+            format!("Unknown tool: {}", call.name)
+        };
 
         ToolExecutionResult {
             name: call.name.clone(),
             output: result,
-            success,
+            success: true,
             tool_call_id: call.tool_call_id.clone(),
         }
     }
@@ -524,6 +708,24 @@ impl Agent {
                 return format!("hint:{}", decision.hint);
             }
         }
+
+        // Fallback: auto-classify by complexity when no rule matched.
+        if let Some(ref ac) = self.config.auto_classify {
+            let tier = super::eval::estimate_complexity(user_message);
+            if let Some(hint) = ac.hint_for(tier) {
+                if self.available_hints.contains(&hint.to_string()) {
+                    tracing::info!(
+                        target: "query_classification",
+                        hint = hint,
+                        complexity = ?tier,
+                        message_length = user_message.len(),
+                        "Auto-classified by complexity"
+                    );
+                    return format!("hint:{hint}");
+                }
+            }
+        }
+
         self.model_name.clone()
     }
 
@@ -534,11 +736,17 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
-        } else if let Some(ConversationMessage::Chat(system_msg)) = self.history.first_mut() {
-            if system_msg.role == "system" {
-                crate::agent::prompt::refresh_prompt_datetime(&mut system_msg.content);
-            }
         }
+
+        let context = self
+            .memory_loader
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
 
         if self.auto_save {
             let _ = self
@@ -547,85 +755,72 @@ impl Agent {
                     "user_msg",
                     user_message,
                     MemoryCategory::Conversation,
-                    self.session_id.as_deref(),
+                    self.memory_session_id.as_deref(),
                 )
                 .await;
         }
 
-        let context = self
-            .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
-            .await
-            .unwrap_or_default();
+        let now = chrono::Local::now();
+        let (year, month, day) = (now.year(), now.month(), now.day());
+        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+        let tz = now.format("%Z");
+        let date_str =
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
 
-        // ── Research Phase ──────────────────────────────────────────────
-        // If enabled and triggered, run a focused research turn to gather
-        // information before the main response.
-        let research_context = if research::should_trigger(&self.research_config, user_message) {
-            if self.research_config.show_progress {
-                println!("[Research] Gathering information...");
-            }
-
-            match research::run_research_phase(
-                &self.research_config,
-                self.provider.as_ref(),
-                &self.tools,
-                user_message,
-                &self.model_name,
-                self.temperature,
-                self.observer.clone(),
-            )
-            .await
-            {
-                Ok(result) => {
-                    if self.research_config.show_progress {
-                        println!(
-                            "[Research] Complete: {} tool calls, {} chars context",
-                            result.tool_call_count,
-                            result.context.len()
-                        );
-                        for summary in &result.tool_summaries {
-                            println!("  - {}: {}", summary.tool_name, summary.result_preview);
-                        }
-                    }
-                    if result.context.is_empty() {
-                        None
-                    } else {
-                        Some(result.context)
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Research phase failed: {}", e);
-                    None
-                }
-            }
+        let enriched = if context.is_empty() {
+            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
         } else {
-            None
-        };
-
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let stamped_user_message = format!("[{now}] {user_message}");
-        let enriched = match (&context, &research_context) {
-            (c, Some(r)) if !c.is_empty() => {
-                format!("{c}\n\n{r}\n\n{stamped_user_message}")
-            }
-            (_, Some(r)) => format!("{r}\n\n{stamped_user_message}"),
-            (c, None) if !c.is_empty() => format!("{c}{stamped_user_message}"),
-            _ => stamped_user_message,
+            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
         };
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
-        let mut loop_detector = LoopDetector::new(LoopDetectionConfig {
-            no_progress_threshold: self.config.loop_detection_no_progress_threshold,
-            ping_pong_cycles: self.config.loop_detection_ping_pong_cycles,
-            failure_streak_threshold: self.config.loop_detection_failure_streak,
-        });
 
-        for iteration in 0..self.config.max_tool_iterations {
+        for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Response cache: check before LLM call (only for deterministic, text-only prompts)
+            let cache_key = if self.temperature == 0.0 {
+                self.response_cache.as_ref().map(|_| {
+                    let last_user = messages
+                        .iter()
+                        .rfind(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let system = messages
+                        .iter()
+                        .find(|m| m.role == "system")
+                        .map(|m| m.content.as_str());
+                    crate::memory::response_cache::ResponseCache::cache_key(
+                        &effective_model,
+                        system,
+                        last_user,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
+                if let Ok(Some(cached)) = cache.get(key) {
+                    self.observer.record_event(&ObserverEvent::CacheHit {
+                        cache_type: "response".into(),
+                        tokens_saved: 0,
+                    });
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            cached.clone(),
+                        )));
+                    self.trim_history();
+                    return Ok(cached);
+                }
+                self.observer.record_event(&ObserverEvent::CacheMiss {
+                    cache_type: "response".into(),
+                });
+            }
+
             let response = match self
                 .provider
                 .chat(
@@ -654,41 +849,22 @@ impl Agent {
                     text
                 };
 
+                // Store in response cache (text-only, no tool calls)
+                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
+                    let token_count = response
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.output_tokens)
+                        .unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
+                }
+
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
-                if self.auto_save && final_text.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                    let _ = self
-                        .memory
-                        .store(
-                            "assistant_resp",
-                            &final_text,
-                            MemoryCategory::Conversation,
-                            self.session_id.as_deref(),
-                        )
-                        .await;
-                }
                 self.trim_history();
-
-                // ── Post-turn fact extraction ──────────────────────
-                if self.auto_save {
-                    self.turn_buffer.push(user_message, &final_text);
-                    if self.turn_buffer.should_extract() {
-                        let turns = self.turn_buffer.drain_for_extraction();
-                        let result = extract_facts_from_turns(
-                            self.provider.as_ref(),
-                            &self.model_name,
-                            &turns,
-                            self.memory.as_ref(),
-                            self.session_id.as_deref(),
-                        )
-                        .await;
-                        if result.stored > 0 || result.no_facts {
-                            self.turn_buffer.mark_extract_success();
-                        }
-                    }
-                }
 
                 return Ok(final_text);
             }
@@ -709,34 +885,9 @@ impl Agent {
             });
 
             let results = self.execute_tools(&calls).await;
-
-            // ── Loop detection: record calls ─────────────────────
-            for (call, result) in calls.iter().zip(results.iter()) {
-                let args_sig =
-                    serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
-                loop_detector.record_call(&call.name, &args_sig, &result.output, result.success);
-            }
-
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
-
-            // ── Loop detection: check verdict ────────────────────
-            match loop_detector.check() {
-                DetectionVerdict::Continue => {}
-                DetectionVerdict::InjectWarning(warning) => {
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::user(warning)));
-                }
-                DetectionVerdict::HardStop(reason) => {
-                    anyhow::bail!(
-                        "Agent stopped early due to detected loop pattern (iteration {}/{}): {}",
-                        iteration + 1,
-                        self.config.max_tool_iterations,
-                        reason
-                    );
-                }
-            }
         }
 
         anyhow::bail!(
@@ -745,44 +896,303 @@ impl Agent {
         )
     }
 
-    /// Flush any remaining buffered turns for fact extraction.
-    /// Call this when the session/conversation ends to avoid losing
-    /// facts from short (< 5 turn) sessions.
+    /// Execute a single agent turn while streaming intermediate events.
     ///
-    /// On failure the turns are restored so callers that keep the agent
-    /// alive can still fall back to compaction-based extraction.
-    pub async fn flush_turn_buffer(&mut self) {
-        if !self.auto_save || self.turn_buffer.is_empty() {
-            return;
+    /// Behaves identically to [`turn`](Self::turn) but forwards [`TurnEvent`]s
+    /// through the provided channel so callers (e.g. the WebSocket gateway)
+    /// can relay incremental updates to clients.
+    ///
+    /// The returned `String` is the final, complete assistant response — the
+    /// same value that `turn` would return.
+    pub async fn turn_streamed(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+    ) -> Result<String> {
+        // ── Preamble (identical to turn) ───────────────────────────────
+        if self.history.is_empty() {
+            let system_prompt = self.build_system_prompt()?;
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(
+                    system_prompt,
+                )));
         }
-        let turns = self.turn_buffer.drain_for_extraction();
-        let result = extract_facts_from_turns(
-            self.provider.as_ref(),
-            &self.model_name,
-            &turns,
-            self.memory.as_ref(),
-            self.session_id.as_deref(),
-        )
-        .await;
-        if result.stored > 0 || result.no_facts {
-            self.turn_buffer.mark_extract_success();
+
+        let context = self
+            .memory_loader
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
+
+        if self.auto_save {
+            let _ = self
+                .memory
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.memory_session_id.as_deref(),
+                )
+                .await;
+        }
+
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if context.is_empty() {
+            format!("[{now}] {user_message}")
         } else {
-            // Restore turns so compaction fallback can still pick them up
-            // if the agent isn't dropped immediately.
-            tracing::warn!(
-                "Exit flush failed; restoring {} turn(s) to buffer",
-                turns.len()
-            );
-            for (u, a) in turns {
-                self.turn_buffer.push(&u, &a);
+            format!("{context}[{now}] {user_message}")
+        };
+
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+
+        let effective_model = self.classify_model(user_message);
+
+        // ── Turn loop ──────────────────────────────────────────────────
+        for _ in 0..self.config.max_tool_iterations {
+            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Response cache check (same as turn)
+            let cache_key = if self.temperature == 0.0 {
+                self.response_cache.as_ref().map(|_| {
+                    let last_user = messages
+                        .iter()
+                        .rfind(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let system = messages
+                        .iter()
+                        .find(|m| m.role == "system")
+                        .map(|m| m.content.as_str());
+                    crate::memory::response_cache::ResponseCache::cache_key(
+                        &effective_model,
+                        system,
+                        last_user,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
+                if let Ok(Some(cached)) = cache.get(key) {
+                    self.observer.record_event(&ObserverEvent::CacheHit {
+                        cache_type: "response".into(),
+                        tokens_saved: 0,
+                    });
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            cached.clone(),
+                        )));
+                    self.trim_history();
+                    return Ok(cached);
+                }
+                self.observer.record_event(&ObserverEvent::CacheMiss {
+                    cache_type: "response".into(),
+                });
             }
+
+            // ── Streaming LLM call ────────────────────────────────────
+            // Try streaming first; if the provider returns content we
+            // forward deltas.  Otherwise fall back to non-streaming chat.
+            use futures_util::StreamExt;
+
+            let stream_opts = crate::providers::traits::StreamOptions::new(true);
+            let mut stream = self.provider.stream_chat(
+                crate::providers::ChatRequest {
+                    messages: &messages,
+                    tools: if self.tool_dispatcher.should_send_tool_specs() {
+                        Some(&self.tool_specs)
+                    } else {
+                        None
+                    },
+                },
+                &effective_model,
+                self.temperature,
+                stream_opts,
+            );
+
+            let mut streamed_text = String::new();
+            let mut streamed_tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
+            let mut got_stream = false;
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(event) => match event {
+                        crate::providers::traits::StreamEvent::TextDelta(chunk) => {
+                            if let Some(reasoning) = chunk.reasoning {
+                                if !reasoning.is_empty() {
+                                    let _ = event_tx
+                                        .send(TurnEvent::Thinking { delta: reasoning })
+                                        .await;
+                                }
+                            }
+                            if !chunk.delta.is_empty() {
+                                got_stream = true;
+                                streamed_text.push_str(&chunk.delta);
+                                let _ =
+                                    event_tx.send(TurnEvent::Chunk { delta: chunk.delta }).await;
+                            }
+                        }
+                        crate::providers::traits::StreamEvent::ToolCall(tc) => {
+                            got_stream = true;
+                            let _ = event_tx
+                                .send(TurnEvent::ToolCall {
+                                    name: tc.name.clone(),
+                                    args: serde_json::from_str(&tc.arguments).unwrap_or_default(),
+                                })
+                                .await;
+                            streamed_tool_calls.push(tc);
+                        }
+                        crate::providers::traits::StreamEvent::PreExecutedToolCall {
+                            name,
+                            args,
+                        } => {
+                            let _ = event_tx
+                                .send(TurnEvent::ToolCall {
+                                    name,
+                                    args: serde_json::from_str(&args).unwrap_or_default(),
+                                })
+                                .await;
+                            // NOT pushed to streamed_tool_calls — already executed by proxy
+                        }
+                        crate::providers::traits::StreamEvent::PreExecutedToolResult {
+                            name,
+                            output,
+                        } => {
+                            let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
+                        }
+                        crate::providers::traits::StreamEvent::Final => break,
+                    },
+                    Err(_) => break,
+                }
+            }
+            // Drop the stream so we release the borrow on provider.
+            drop(stream);
+
+            // If streaming produced text, use it as the response and
+            // check for tool calls via the dispatcher.
+            let response = if got_stream {
+                // Build a synthetic ChatResponse from streamed text
+                crate::providers::ChatResponse {
+                    text: Some(streamed_text),
+                    tool_calls: streamed_tool_calls,
+                    usage: None,
+                    reasoning_content: None,
+                }
+            } else {
+                // Fall back to non-streaming chat
+                match self
+                    .provider
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: if self.tool_dispatcher.should_send_tool_specs() {
+                                Some(&self.tool_specs)
+                            } else {
+                                None
+                            },
+                        },
+                        &effective_model,
+                        self.temperature,
+                    )
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(err) => return Err(err),
+                }
+            };
+
+            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            if calls.is_empty() {
+                let final_text = if text.is_empty() {
+                    response.text.unwrap_or_default()
+                } else {
+                    text
+                };
+
+                // Store in response cache
+                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
+                    let token_count = response
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.output_tokens)
+                        .unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
+                }
+
+                // If we didn't stream, send the full response as a single chunk
+                if !got_stream && !final_text.is_empty() {
+                    let _ = event_tx
+                        .send(TurnEvent::Chunk {
+                            delta: final_text.clone(),
+                        })
+                        .await;
+                }
+
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        final_text.clone(),
+                    )));
+                self.trim_history();
+
+                return Ok(final_text);
+            }
+
+            // ── Tool calls ─────────────────────────────────────────────
+            if !text.is_empty() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        text.clone(),
+                    )));
+            }
+
+            self.history.push(ConversationMessage::AssistantToolCalls {
+                text: response.text.clone(),
+                tool_calls: response.tool_calls.clone(),
+                reasoning_content: response.reasoning_content.clone(),
+            });
+
+            // Notify about each tool call
+            for call in &calls {
+                let _ = event_tx
+                    .send(TurnEvent::ToolCall {
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                    })
+                    .await;
+            }
+
+            let results = self.execute_tools(&calls).await;
+
+            // Notify about each tool result
+            for result in &results {
+                let _ = event_tx
+                    .send(TurnEvent::ToolResult {
+                        name: result.name.clone(),
+                        output: result.output.clone(),
+                    })
+                    .await;
+            }
+
+            let formatted = self.tool_dispatcher.format_results(&results);
+            self.history.push(formatted);
+            self.trim_history();
         }
+
+        anyhow::bail!(
+            "Agent exceeded maximum tool iterations ({})",
+            self.config.max_tool_iterations
+        )
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        let result = self.turn(message).await?;
-        self.flush_turn_buffer().await;
-        Ok(result)
+        self.turn(message).await
     }
 
     pub async fn run_interactive(&mut self) -> Result<()> {
@@ -808,7 +1218,6 @@ impl Agent {
         }
 
         listen_handle.abort();
-        self.flush_turn_buffer().await;
         Ok(())
     }
 }
@@ -831,7 +1240,7 @@ pub async fn run(
     }
     effective_config.default_temperature = temperature;
 
-    let mut agent = Agent::from_config(&effective_config)?;
+    let mut agent = Agent::from_config(&effective_config).await?;
 
     let provider_name = effective_config
         .default_provider
@@ -841,12 +1250,8 @@ pub async fn run(
     let model_name = effective_config
         .default_model
         .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            crate::config::default_model_fallback_for_provider(Some(&provider_name)).to_string()
-        });
+        .unwrap_or("anthropic/claude-sonnet-4-20250514")
+        .to_string();
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
@@ -877,7 +1282,6 @@ mod tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
-    use tempfile::TempDir;
 
     struct MockProvider {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
@@ -908,9 +1312,6 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -948,9 +1349,6 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 });
             }
             Ok(guard.remove(0))
@@ -990,9 +1388,6 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
-                quota_metadata: None,
-                stop_reason: None,
-                raw_stop_reason: None,
             }]),
         });
 
@@ -1033,18 +1428,12 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
-                    stop_reason: None,
-                    raw_stop_reason: None,
                 },
             ]),
         });
@@ -1071,10 +1460,12 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
-        assert!(agent
-            .history()
-            .iter()
-            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+        assert!(
+            agent
+                .history()
+                .iter()
+                .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
+        );
     }
 
     #[tokio::test]
@@ -1086,9 +1477,6 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
-                quota_metadata: None,
-                stop_reason: None,
-                raw_stop_reason: None,
             }]),
             seen_models: seen_models.clone(),
         });
@@ -1134,117 +1522,370 @@ mod tests {
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
     }
 
-    #[test]
-    fn from_config_loads_plugin_declared_tools() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
+    #[tokio::test]
+    async fn from_config_passes_extra_headers_to_custom_provider() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+
+        let captured_headers: Arc<std::sync::Mutex<Option<HashMap<String, String>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured_headers_clone = captured_headers.clone();
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(
+                move |headers: HeaderMap, Json(_body): Json<serde_json::Value>| {
+                    let captured_headers = captured_headers_clone.clone();
+                    async move {
+                        let collected = headers
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                value
+                                    .to_str()
+                                    .ok()
+                                    .map(|value| (name.as_str().to_string(), value.to_string()))
+                            })
+                            .collect();
+                        *captured_headers.lock().unwrap() = Some(collected);
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "hello from mock"
+                                }
+                            }]
+                        }))
+                    }
+                },
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
         let tmp = TempDir::new().expect("temp dir");
-        let plugin_dir = tmp.path().join("plugins");
-        std::fs::create_dir_all(&plugin_dir).expect("create plugin dir");
-        std::fs::create_dir_all(tmp.path().join("workspace")).expect("create workspace dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
 
-        std::fs::write(
-            plugin_dir.join("agent_from_config.plugin.toml"),
-            r#"
-id = "agent-from-config"
-version = "1.0.0"
-module_path = "plugins/agent-from-config.wasm"
-wit_packages = ["zeroclaw:tools@1.0.0"]
-
-[[tools]]
-name = "__agent_from_config_plugin_tool"
-description = "plugin tool exposed for from_config tests"
-"#,
-        )
-        .expect("write plugin manifest");
-
-        let mut config = Config::default();
-        config.workspace_dir = tmp.path().join("workspace");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir;
         config.config_path = tmp.path().join("config.toml");
-        config.default_provider = Some("ollama".to_string());
+        config.api_key = Some("test-key".to_string());
+        config.default_provider = Some(format!("custom:http://{addr}"));
+        config.default_model = Some("test-model".to_string());
         config.memory.backend = "none".to_string();
-        config.plugins = crate::config::PluginsConfig {
-            enabled: true,
-            load_paths: vec![plugin_dir.to_string_lossy().to_string()],
-            ..crate::config::PluginsConfig::default()
-        };
-
-        let agent = Agent::from_config(&config).expect("agent from config should build");
-        assert!(agent
-            .tools
-            .iter()
-            .any(|tool| tool.name() == "__agent_from_config_plugin_tool"));
-    }
-
-    fn base_from_config_for_tool_filter_tests() -> Config {
-        let root = std::env::temp_dir().join(format!(
-            "zeroclaw_agent_tool_filter_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(root.join("workspace")).expect("create workspace dir");
-
-        let mut config = Config::default();
-        config.workspace_dir = root.join("workspace");
-        config.config_path = root.join("config.toml");
-        config.default_provider = Some("ollama".to_string());
-        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.extra_headers.insert(
+            "User-Agent".to_string(),
+            "zeroclaw-web-test/1.0".to_string(),
+        );
         config
+            .extra_headers
+            .insert("X-Title".to_string(), "zeroclaw-web".to_string());
+
+        let mut agent = Agent::from_config(&config)
+            .await
+            .expect("agent from config");
+        let response = agent.turn("hello").await.expect("agent turn");
+
+        assert_eq!(response, "hello from mock");
+
+        let headers = captured_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured headers");
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("zeroclaw-web-test/1.0")
+        );
+        assert_eq!(
+            headers.get("x-title").map(String::as_str),
+            Some("zeroclaw-web")
+        );
+
+        server_handle.abort();
     }
 
     #[test]
-    fn from_config_primary_allowlist_filters_tools() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.allowed_tools = vec!["shell".to_string()];
+    fn builder_allowed_tools_none_keeps_all_tools() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
 
-        let agent = Agent::from_config(&config).expect("agent should build");
-        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
-        assert_eq!(names, vec!["shell"]);
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .allowed_tools(None)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert_eq!(agent.tool_specs.len(), 1);
+        assert_eq!(agent.tool_specs[0].name, "echo");
     }
 
     #[test]
-    fn from_config_empty_allowlist_preserves_default_toolset() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let config = base_from_config_for_tool_filter_tests();
+    fn builder_allowed_tools_some_filters_tools() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
 
-        let agent = Agent::from_config(&config).expect("agent should build");
-        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
-        assert!(names.contains(&"shell"));
-        assert!(names.contains(&"file_read"));
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .allowed_tools(Some(vec!["nonexistent".to_string()]))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert!(
+            agent.tool_specs.is_empty(),
+            "No tools should match a non-existent allowlist entry"
+        );
     }
 
     #[test]
-    fn from_config_primary_denylist_removes_tools() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.denied_tools = vec!["shell".to_string()];
+    fn seed_history_prepends_system_and_skips_system_from_seed() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
 
-        let agent = Agent::from_config(&config).expect("agent should build");
-        let names: Vec<&str> = agent.tools.iter().map(|tool| tool.name()).collect();
-        assert!(!names.contains(&"shell"));
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let seed = vec![
+            ChatMessage::system("old system prompt"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+        ];
+        agent.seed_history(&seed);
+
+        let history = agent.history();
+        // First message should be a freshly built system prompt (not the seed one)
+        assert!(matches!(&history[0], ConversationMessage::Chat(m) if m.role == "system"));
+        // System message from seed should be skipped, so next is user
+        assert!(
+            matches!(&history[1], ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello")
+        );
+        assert!(
+            matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
+        );
+        assert_eq!(history.len(), 3);
     }
 
-    #[test]
-    fn from_config_unmatched_allowlist_entry_is_graceful() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.allowed_tools = vec!["missing_tool".to_string()];
-
-        let agent = Agent::from_config(&config).expect("agent should build with empty toolset");
-        assert!(agent.tools.is_empty());
+    /// Mock provider that captures whether tool specs were passed to `stream_chat`
+    /// and returns a tool call followed by a text response through the stream.
+    struct StreamToolCaptureProvider {
+        tools_received: Arc<Mutex<Vec<bool>>>,
+        call_count: Arc<Mutex<usize>>,
     }
 
-    #[test]
-    fn from_config_conflicting_allow_and_deny_fails_fast() {
-        let _guard = crate::test_locks::PLUGIN_RUNTIME_LOCK.lock();
-        let mut config = base_from_config_for_tool_filter_tests();
-        config.agent.allowed_tools = vec!["shell".to_string()];
-        config.agent.denied_tools = vec!["shell".to_string()];
+    #[async_trait]
+    impl Provider for StreamToolCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
 
-        let err = Agent::from_config(&config)
-            .err()
-            .expect("expected filter conflict");
-        assert!(err
-            .to_string()
-            .contains("agent.allowed_tools and agent.denied_tools removed all executable tools"));
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            self.tools_received.lock().push(request.tools.is_some());
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                Ok(crate::providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "tc_stream_1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(crate::providers::ChatResponse {
+                    text: Some("stream-done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: crate::providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            self.tools_received.lock().push(request.tools.is_some());
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                let tc =
+                    crate::providers::traits::StreamEvent::ToolCall(crate::providers::ToolCall {
+                        id: "tc_stream_1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    });
+                stream::iter(vec![
+                    Ok(tc),
+                    Ok(crate::providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                let chunk = crate::providers::traits::StreamEvent::TextDelta(
+                    crate::providers::traits::StreamChunk {
+                        delta: "stream-done".into(),
+                        is_final: false,
+                        reasoning: None,
+                        token_count: 0,
+                    },
+                );
+                stream::iter(vec![
+                    Ok(chunk),
+                    Ok(crate::providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_passes_tool_specs_to_provider() {
+        let tools_received = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(StreamToolCaptureProvider {
+            tools_received: tools_received.clone(),
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = agent
+            .turn_streamed("use the echo tool", event_tx)
+            .await
+            .unwrap();
+        assert_eq!(response, "stream-done");
+
+        // Verify tools were passed in both stream_chat calls
+        let received = tools_received.lock();
+        assert!(
+            received.len() >= 2,
+            "Expected at least 2 stream_chat calls, got {}",
+            received.len()
+        );
+        assert!(
+            received[0],
+            "First stream_chat call should have received tool specs"
+        );
+        assert!(
+            received[1],
+            "Second stream_chat call should have received tool specs"
+        );
+
+        // Collect events and verify tool call + tool result were emitted
+        let mut events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+        let has_tool_call = events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolCall { name, .. } if name == "echo"));
+        let has_tool_result = events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolResult { name, .. } if name == "echo"));
+        assert!(
+            has_tool_call,
+            "Should have emitted a ToolCall event for 'echo'"
+        );
+        assert!(
+            has_tool_result,
+            "Should have emitted a ToolResult event for 'echo'"
+        );
     }
 }

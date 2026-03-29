@@ -1,17 +1,10 @@
-use crate::config::{build_runtime_proxy_client_with_timeouts, MultimodalConfig};
+use crate::config::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 use crate::providers::ChatMessage;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
-use std::io::Cursor;
 use std::path::Path;
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-const OPTIMIZED_IMAGE_MAX_DIMENSION: u32 = 512;
-const OPTIMIZED_IMAGE_TARGET_BYTES: usize = 256 * 1024;
-const REMOTE_FETCH_MULTIMODAL_SERVICE_KEY: &str = "tool.multimodal";
-const REMOTE_FETCH_TOOL_SERVICE_KEY: &str = "tool.http_request";
-const REMOTE_FETCH_QQ_SERVICE_KEY: &str = "channel.qq";
-const REMOTE_FETCH_LEGACY_SERVICE_KEY: &str = "provider.ollama";
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
@@ -31,7 +24,9 @@ pub enum MultimodalError {
     #[error("multimodal image limit exceeded: max_images={max_images}, found={found}")]
     TooManyImages { max_images: usize, found: usize },
 
-    #[error("multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes")]
+    #[error(
+        "multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes"
+    )]
     ImageTooLarge {
         input: String,
         size_bytes: usize,
@@ -123,35 +118,33 @@ pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
 ) -> anyhow::Result<PreparedMessages> {
-    prepare_messages_for_provider_with_provider_hint(messages, config, None).await
-}
-
-pub async fn prepare_messages_for_provider_with_provider_hint(
-    messages: &[ChatMessage],
-    config: &MultimodalConfig,
-    provider_hint: Option<&str>,
-) -> anyhow::Result<PreparedMessages> {
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let found_images = count_image_markers(messages);
-    if found_images > max_images {
-        return Err(MultimodalError::TooManyImages {
-            max_images,
-            found: found_images,
-        }
-        .into());
-    }
+    let total_images = count_image_markers(messages);
 
-    if found_images == 0 {
+    if total_images == 0 {
         return Ok(PreparedMessages {
             messages: messages.to_vec(),
             contains_images: false,
         });
     }
 
-    let mut normalized_messages = Vec::with_capacity(messages.len());
-    for message in messages {
+    // When image count exceeds the limit, strip markers from oldest messages
+    // first so that the most recent (most relevant) images survive. This
+    // prevents conversations from becoming permanently stuck once the
+    // cumulative image count crosses the threshold.
+    let trimmed = if total_images > max_images {
+        trim_old_images(messages, max_images)
+    } else {
+        messages.to_vec()
+    };
+
+    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
+
+    let mut normalized_messages = Vec::with_capacity(trimmed.len());
+    let mut has_successful_images = false;
+    for message in &trimmed {
         if message.role != "user" {
             normalized_messages.push(message.clone());
             continue;
@@ -166,7 +159,7 @@ pub async fn prepare_messages_for_provider_with_provider_hint(
         let mut normalized_refs = Vec::with_capacity(refs.len());
         for reference in refs {
             let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, provider_hint).await?;
+                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
             normalized_refs.push(data_uri);
         }
 
@@ -181,6 +174,56 @@ pub async fn prepare_messages_for_provider_with_provider_hint(
         messages: normalized_messages,
         contains_images: true,
     })
+}
+
+/// Strip image markers from older messages (oldest first) until total image
+/// count is within `max_images`. Keeps the text content of each message.
+fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
+    // Find which messages (by index) contain images, oldest first.
+    let image_positions: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .filter_map(|(i, m)| {
+            let count = parse_image_markers(&m.content).1.len();
+            if count > 0 { Some((i, count)) } else { None }
+        })
+        .collect();
+
+    // Determine how many images to drop (from the oldest messages).
+    let total: usize = image_positions.iter().map(|(_, c)| c).sum();
+    let mut to_drop = total.saturating_sub(max_images);
+
+    // Collect indices of messages whose images should be stripped.
+    let mut strip_indices = std::collections::HashSet::new();
+    for &(idx, count) in &image_positions {
+        if to_drop == 0 {
+            break;
+        }
+        strip_indices.insert(idx);
+        to_drop = to_drop.saturating_sub(count);
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if strip_indices.contains(&i) {
+                let (cleaned, _) = parse_image_markers(&m.content);
+                let text = if cleaned.trim().is_empty() {
+                    "[image removed from history]".to_string()
+                } else {
+                    cleaned
+                };
+                ChatMessage {
+                    role: m.role.clone(),
+                    content: text,
+                }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
 }
 
 fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
@@ -208,10 +251,10 @@ async fn normalize_image_reference(
     source: &str,
     config: &MultimodalConfig,
     max_bytes: usize,
-    provider_hint: Option<&str>,
+    remote_client: &Client,
 ) -> anyhow::Result<String> {
     if source.starts_with("data:") {
-        return normalize_data_uri(source, max_bytes).await;
+        return normalize_data_uri(source, max_bytes);
     }
 
     if source.starts_with("http://") || source.starts_with("https://") {
@@ -222,13 +265,13 @@ async fn normalize_image_reference(
             .into());
         }
 
-        return normalize_remote_image(source, max_bytes, provider_hint).await;
+        return normalize_remote_image(source, max_bytes, remote_client).await;
     }
 
     normalize_local_image(source, max_bytes).await
 }
 
-async fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> {
+fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> {
     let Some(comma_idx) = source.find(',') else {
         return Err(MultimodalError::InvalidMarker {
             input: source.to_string(),
@@ -265,70 +308,30 @@ async fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<St
             reason: format!("invalid base64 payload: {error}"),
         })?;
 
-    let (optimized_bytes, optimized_mime) =
-        optimize_image_for_prompt(source, decoded, &mime).await?;
-    validate_size(source, optimized_bytes.len(), max_bytes)?;
+    validate_size(source, decoded.len(), max_bytes)?;
 
-    Ok(format!(
-        "data:{optimized_mime};base64,{}",
-        STANDARD.encode(optimized_bytes)
-    ))
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
 }
 
 async fn normalize_remote_image(
     source: &str,
     max_bytes: usize,
-    provider_hint: Option<&str>,
-) -> anyhow::Result<String> {
-    let service_keys = build_remote_fetch_service_keys(source, provider_hint);
-    let mut failures = Vec::new();
-
-    for service_key in service_keys {
-        let client = build_runtime_proxy_client_with_timeouts(&service_key, 30, 10);
-        match normalize_remote_image_once(source, max_bytes, &client).await {
-            Ok(normalized) => return Ok(normalized),
-            Err(error) => {
-                let reason = error.to_string();
-                tracing::debug!(
-                    service_key = %service_key,
-                    source = %source,
-                    "multimodal remote fetch attempt failed: {reason}"
-                );
-                failures.push(format!("{service_key}: {reason}"));
-            }
-        }
-    }
-
-    Err(MultimodalError::RemoteFetchFailed {
-        input: source.to_string(),
-        reason: format!(
-            "{}; hint: when proxy.scope='services', include one of channel.qq/tool.multimodal/tool.http_request/provider.* as needed",
-            failures.join(" | ")
-        ),
-    }
-    .into())
-}
-
-async fn normalize_remote_image_once(
-    source: &str,
-    max_bytes: usize,
     remote_client: &Client,
 ) -> anyhow::Result<String> {
-    let mut request = remote_client
-        .get(source)
-        .header(reqwest::header::USER_AGENT, "ZeroClaw/1.0");
-    if source_looks_like_qq_media(source) {
-        request = request.header(reqwest::header::REFERER, "https://qq.com/");
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|error| anyhow::anyhow!("error sending request for url ({source}): {error}"))?;
+    let response = remote_client.get(source).send().await.map_err(|error| {
+        MultimodalError::RemoteFetchFailed {
+            input: source.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
 
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!("HTTP {status}");
+        return Err(MultimodalError::RemoteFetchFailed {
+            input: source.to_string(),
+            reason: format!("HTTP {status}"),
+        }
+        .into());
     }
 
     if let Some(content_length) = response.content_length() {
@@ -345,7 +348,10 @@ async fn normalize_remote_image_once(
     let bytes = response
         .bytes()
         .await
-        .map_err(|error| anyhow::anyhow!("failed to read response body: {error}"))?;
+        .map_err(|error| MultimodalError::RemoteFetchFailed {
+            input: source.to_string(),
+            reason: error.to_string(),
+        })?;
 
     validate_size(source, bytes.len(), max_bytes)?;
 
@@ -357,80 +363,8 @@ async fn normalize_remote_image_once(
     })?;
 
     validate_mime(source, &mime)?;
-    let (optimized_bytes, optimized_mime) =
-        optimize_image_for_prompt(source, bytes.to_vec(), &mime).await?;
-    validate_size(source, optimized_bytes.len(), max_bytes)?;
 
-    Ok(format!(
-        "data:{optimized_mime};base64,{}",
-        STANDARD.encode(optimized_bytes)
-    ))
-}
-
-fn normalize_provider_service_key_hint(provider_hint: Option<&str>) -> Option<String> {
-    let raw = provider_hint
-        .map(str::trim)
-        .filter(|candidate| !candidate.is_empty())?
-        .split('#')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-
-    if raw.is_empty() {
-        return None;
-    }
-
-    let candidate = if raw.starts_with("provider.") {
-        raw
-    } else {
-        format!("provider.{raw}")
-    };
-
-    if !candidate
-        .chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
-    {
-        return None;
-    }
-
-    Some(candidate)
-}
-
-fn source_looks_like_qq_media(source: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(source) else {
-        return false;
-    };
-
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-
-    let host = host.to_ascii_lowercase();
-    host == "multimedia.nt.qq.com.cn" || host.ends_with(".qq.com.cn") || host.ends_with(".qq.com")
-}
-
-fn push_service_key_once(keys: &mut Vec<String>, key: String) {
-    if !key.trim().is_empty() && !keys.iter().any(|existing| existing == &key) {
-        keys.push(key);
-    }
-}
-
-fn build_remote_fetch_service_keys(source: &str, provider_hint: Option<&str>) -> Vec<String> {
-    let mut keys = Vec::new();
-
-    if source_looks_like_qq_media(source) {
-        push_service_key_once(&mut keys, REMOTE_FETCH_QQ_SERVICE_KEY.to_string());
-    }
-
-    if let Some(provider_service_key) = normalize_provider_service_key_hint(provider_hint) {
-        push_service_key_once(&mut keys, provider_service_key);
-    }
-
-    push_service_key_once(&mut keys, REMOTE_FETCH_MULTIMODAL_SERVICE_KEY.to_string());
-    push_service_key_once(&mut keys, REMOTE_FETCH_TOOL_SERVICE_KEY.to_string());
-    push_service_key_once(&mut keys, REMOTE_FETCH_LEGACY_SERVICE_KEY.to_string());
-    keys
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
 async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result<String> {
@@ -472,78 +406,8 @@ async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result
         })?;
 
     validate_mime(source, &mime)?;
-    let (optimized_bytes, optimized_mime) = optimize_image_for_prompt(source, bytes, &mime).await?;
-    validate_size(source, optimized_bytes.len(), max_bytes)?;
 
-    Ok(format!(
-        "data:{optimized_mime};base64,{}",
-        STANDARD.encode(optimized_bytes)
-    ))
-}
-
-async fn optimize_image_for_prompt(
-    source: &str,
-    bytes: Vec<u8>,
-    mime: &str,
-) -> anyhow::Result<(Vec<u8>, String)> {
-    validate_mime(source, mime)?;
-
-    let source_owned = source.to_string();
-    let mime_owned = mime.to_string();
-    tokio::task::spawn_blocking(move || {
-        optimize_image_for_prompt_blocking(source_owned, bytes, mime_owned)
-    })
-    .await
-    .map_err(|error| MultimodalError::InvalidMarker {
-        input: source.to_string(),
-        reason: format!("failed to optimize image payload: {error}"),
-    })?
-}
-
-fn optimize_image_for_prompt_blocking(
-    source: String,
-    bytes: Vec<u8>,
-    mime: String,
-) -> anyhow::Result<(Vec<u8>, String)> {
-    let decoded = match image::load_from_memory(&bytes) {
-        Ok(decoded) => decoded,
-        Err(_) => return Ok((bytes, mime)),
-    };
-
-    let resized = if decoded.width() > OPTIMIZED_IMAGE_MAX_DIMENSION
-        || decoded.height() > OPTIMIZED_IMAGE_MAX_DIMENSION
-    {
-        decoded.thumbnail(OPTIMIZED_IMAGE_MAX_DIMENSION, OPTIMIZED_IMAGE_MAX_DIMENSION)
-    } else {
-        decoded
-    };
-
-    let mut best_jpeg = Vec::new();
-    for quality in [85_u8, 70_u8, 55_u8, 40_u8] {
-        let mut encoded = Vec::new();
-        {
-            let mut cursor = Cursor::new(&mut encoded);
-            let mut encoder =
-                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
-            encoder
-                .encode_image(&resized)
-                .map_err(|error| MultimodalError::InvalidMarker {
-                    input: source.clone(),
-                    reason: format!("failed to encode optimized image: {error}"),
-                })?;
-        }
-
-        best_jpeg = encoded;
-        if best_jpeg.len() <= OPTIMIZED_IMAGE_TARGET_BYTES {
-            return Ok((best_jpeg, "image/jpeg".to_string()));
-        }
-    }
-
-    if best_jpeg.len() < bytes.len() {
-        return Ok((best_jpeg, "image/jpeg".to_string()));
-    }
-
-    Ok((bytes, mime))
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
 fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::Result<()> {
@@ -593,11 +457,7 @@ fn detect_mime(
 
 fn normalize_content_type(content_type: &str) -> Option<String> {
     let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
-    if mime.is_empty() {
-        None
-    } else {
-        Some(mime)
-    }
+    if mime.is_empty() { None } else { Some(mime) }
 }
 
 fn mime_from_extension(ext: &str) -> Option<&'static str> {
@@ -690,24 +550,228 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_too_many_images() {
-        let messages = vec![ChatMessage::user(
-            "[IMAGE:/tmp/1.png]\n[IMAGE:/tmp/2.png]".to_string(),
-        )];
+    async fn prepare_messages_trims_excess_images_from_older_messages() {
+        // 3 messages, each with 1 image — max is 2.
+        // The oldest message's image should be stripped.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/old.png]\nOld caption".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/mid.png]\nMid caption".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/new.png]\nNew caption".to_string()),
+        ];
+
+        // Should not error — instead trims oldest.
+        // (Will error on normalize_image_reference for the surviving images
+        //  since /tmp/mid.png and /tmp/new.png don't exist, but the trimming
+        //  itself should succeed.)
+        let trimmed = trim_old_images(&messages, 2);
+        assert_eq!(trimmed.len(), 3);
+
+        // Oldest message should have image stripped
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty(), "oldest image should be stripped");
+        assert!(trimmed[0].content.contains("Old caption"));
+
+        // Newer messages keep their images
+        let (_, refs1) = parse_image_markers(&trimmed[1].content);
+        assert_eq!(refs1.len(), 1);
+        let (_, refs2) = parse_image_markers(&trimmed[2].content);
+        assert_eq!(refs2.len(), 1);
+    }
+
+    #[test]
+    fn trim_old_images_replaces_image_only_message() {
+        // A message with only an image and no text should get a placeholder.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/old.png]".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/new.png]\nKeep this".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 1);
+        assert_eq!(trimmed[0].content, "[image removed from history]");
+        assert!(trimmed[1].content.contains("[IMAGE:/tmp/new.png]"));
+    }
+
+    #[test]
+    fn trim_old_images_multi_image_message_stripped_as_unit() {
+        // A single message has 3 images. We need to drop 2 to reach max=1.
+        // But trimming works at message granularity — the entire message gets
+        // stripped (all 3 images removed), which over-trims to 0. The newest
+        // message (text-only) is untouched.
+        let messages = vec![
+            ChatMessage::user(
+                "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nThree pics"
+                    .to_string(),
+            ),
+            ChatMessage::user("Just text, no images".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 1);
+        assert_eq!(trimmed.len(), 2);
+        // All images in the first message are gone, but text remains
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty());
+        assert!(trimmed[0].content.contains("Three pics"));
+        // Second message unchanged
+        assert_eq!(trimmed[1].content, "Just text, no images");
+    }
+
+    #[test]
+    fn trim_old_images_skips_assistant_messages() {
+        // Assistant messages with image markers should not be counted or stripped.
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "[IMAGE:/tmp/assistant.png]\nAssistant generated".to_string(),
+            },
+            ChatMessage::user("[IMAGE:/tmp/user1.png]\nFirst".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/user2.png]\nSecond".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 1);
+        // Assistant message untouched (not counted toward limit)
+        assert!(trimmed[0].content.contains("[IMAGE:/tmp/assistant.png]"));
+        // Oldest user image stripped
+        let (_, refs1) = parse_image_markers(&trimmed[1].content);
+        assert!(refs1.is_empty());
+        assert!(trimmed[1].content.contains("First"));
+        // Newest user image kept
+        let (_, refs2) = parse_image_markers(&trimmed[2].content);
+        assert_eq!(refs2.len(), 1);
+    }
+
+    #[test]
+    fn trim_old_images_no_trimming_when_under_limit() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\nCaption A".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/b.png]\nCaption B".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 5);
+        // Nothing should change — both images are under the limit
+        assert_eq!(trimmed[0].content, messages[0].content);
+        assert_eq!(trimmed[1].content, messages[1].content);
+    }
+
+    #[test]
+    fn trim_old_images_no_trimming_when_exactly_at_limit() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\nA".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/b.png]\nB".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 2);
+        assert_eq!(trimmed[0].content, messages[0].content);
+        assert_eq!(trimmed[1].content, messages[1].content);
+    }
+
+    #[test]
+    fn trim_old_images_empty_messages() {
+        let trimmed = trim_old_images(&[], 4);
+        assert!(trimmed.is_empty());
+    }
+
+    #[test]
+    fn trim_old_images_interleaved_roles() {
+        // Realistic conversation: user sends image, assistant replies, user sends
+        // another image, etc. Only user messages should be candidates for trimming.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/1.png]\nLook at this".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I see a photo.".to_string(),
+            },
+            ChatMessage::user("[IMAGE:/tmp/2.png]\nWhat about this?".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "That's a chart.".to_string(),
+            },
+            ChatMessage::user("[IMAGE:/tmp/3.png]\nAnd this one".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 2);
+        assert_eq!(trimmed.len(), 5);
+        // Oldest user image stripped
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty());
+        assert!(trimmed[0].content.contains("Look at this"));
+        // Assistant messages untouched
+        assert_eq!(trimmed[1].content, "I see a photo.");
+        assert_eq!(trimmed[3].content, "That's a chart.");
+        // Two newest user images kept
+        let (_, refs2) = parse_image_markers(&trimmed[2].content);
+        assert_eq!(refs2.len(), 1);
+        let (_, refs4) = parse_image_markers(&trimmed[4].content);
+        assert_eq!(refs4.len(), 1);
+    }
+
+    #[test]
+    fn trim_old_images_strips_multiple_oldest_messages() {
+        // 5 user images, max 1 — should strip the first 4 messages' images.
+        let messages: Vec<ChatMessage> = (1..=5)
+            .map(|i| ChatMessage::user(format!("[IMAGE:/tmp/{i}.png]\nCaption {i}")))
+            .collect();
+
+        let trimmed = trim_old_images(&messages, 1);
+        assert_eq!(trimmed.len(), 5);
+        for (i, msg) in trimmed.iter().enumerate().take(4) {
+            let (_, refs) = parse_image_markers(&msg.content);
+            assert!(refs.is_empty(), "message {i} should have images stripped");
+            assert!(msg.content.contains(&format!("Caption {}", i + 1)));
+        }
+        // Only the last message keeps its image
+        let (_, refs_last) = parse_image_markers(&trimmed[4].content);
+        assert_eq!(refs_last.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_trims_then_normalizes_surviving_images() {
+        // End-to-end: 3 images, max 2. After trimming the oldest, the two
+        // surviving images should be normalized (base64-encoded) successfully.
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for name in ["old.png", "mid.png", "new.png"] {
+            let p = temp.path().join(name);
+            // Minimal valid PNG (1x1 white pixel)
+            let png_data = [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+                0x77, 0x53, 0xDE, // 1x1 RGB
+                0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
+                0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21,
+                0xBC, 0x33, // IDAT data + CRC
+                0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
+                0xAE, 0x42, 0x60, 0x82,
+            ];
+            std::fs::write(&p, png_data).unwrap();
+            paths.push(p);
+        }
+
+        let messages = vec![
+            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display())),
+            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display())),
+            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display())),
+        ];
 
         let config = MultimodalConfig {
-            max_images: 1,
+            max_images: 2,
             max_image_size_mb: 5,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect_err("should reject image count overflow");
+            .expect("should succeed after trimming");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image limit exceeded"));
+        assert!(result.contains_images);
+        assert_eq!(result.messages.len(), 3);
+        // First message should have image stripped, text preserved
+        assert!(!result.messages[0].content.contains("data:image"));
+        assert!(result.messages[0].content.contains("Old"));
+        // Second and third should have base64-encoded images
+        assert!(result.messages[1].content.contains("data:image"));
+        assert!(result.messages[2].content.contains("data:image"));
     }
 
     #[tokio::test]
@@ -720,9 +784,11 @@ mod tests {
             .await
             .expect_err("should reject remote image URL when fetch is disabled");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal remote image fetch is disabled"));
+        assert!(
+            error
+                .to_string()
+                .contains("multimodal remote image fetch is disabled")
+        );
     }
 
     #[tokio::test]
@@ -741,108 +807,17 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
             .await
             .expect_err("should reject oversized local image");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
-    }
-
-    #[tokio::test]
-    async fn normalize_data_uri_downscales_large_images_for_prompt_budget() {
-        let mut image = image::RgbImage::new(1800, 1200);
-        for (x, y, pixel) in image.enumerate_pixels_mut() {
-            *pixel = image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8]);
-        }
-
-        let mut png_bytes = Vec::new();
-        image::DynamicImage::ImageRgb8(image)
-            .write_to(
-                &mut std::io::Cursor::new(&mut png_bytes),
-                image::ImageFormat::Png,
-            )
-            .unwrap();
-        let original_size = png_bytes.len();
-
-        let source = format!("data:image/png;base64,{}", STANDARD.encode(&png_bytes));
-        let optimized = normalize_data_uri(&source, 5 * 1024 * 1024)
-            .await
-            .expect("data uri should normalize");
-        assert!(optimized.starts_with("data:image/jpeg;base64,"));
-
-        let payload = optimized
-            .split_once(',')
-            .map(|(_, payload)| payload)
-            .expect("optimized data URI payload");
-        let optimized_bytes = STANDARD.decode(payload).expect("base64 decode");
         assert!(
-            optimized_bytes.len() < original_size,
-            "optimized bytes should be smaller than original PNG payload"
-        );
-
-        let optimized_image = image::load_from_memory(&optimized_bytes).expect("decode optimized");
-        assert!(optimized_image.width() <= OPTIMIZED_IMAGE_MAX_DIMENSION);
-        assert!(optimized_image.height() <= OPTIMIZED_IMAGE_MAX_DIMENSION);
-    }
-
-    #[test]
-    fn normalize_provider_service_key_hint_builds_provider_prefix() {
-        assert_eq!(
-            normalize_provider_service_key_hint(Some("openai")),
-            Some("provider.openai".to_string())
-        );
-        assert_eq!(
-            normalize_provider_service_key_hint(Some("provider.gemini")),
-            Some("provider.gemini".to_string())
-        );
-        assert_eq!(normalize_provider_service_key_hint(Some("   ")), None);
-        assert_eq!(normalize_provider_service_key_hint(None), None);
-        assert_eq!(
-            normalize_provider_service_key_hint(Some("openai#fast-route")),
-            Some("provider.openai".to_string())
-        );
-        assert_eq!(
-            normalize_provider_service_key_hint(Some("provider.gemini#img")),
-            Some("provider.gemini".to_string())
-        );
-        assert_eq!(
-            normalize_provider_service_key_hint(Some("custom:https://api.example.com/v1")),
-            None
-        );
-    }
-
-    #[test]
-    fn build_remote_fetch_service_keys_prefers_qq_channel_for_qq_media_hosts() {
-        let keys = build_remote_fetch_service_keys(
-            "https://multimedia.nt.qq.com.cn/download?appid=1406",
-            Some("openai"),
-        );
-        assert_eq!(
-            keys,
-            vec![
-                "channel.qq".to_string(),
-                "provider.openai".to_string(),
-                "tool.multimodal".to_string(),
-                "tool.http_request".to_string(),
-                "provider.ollama".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn build_remote_fetch_service_keys_deduplicates_service_candidates() {
-        let keys = build_remote_fetch_service_keys("https://example.com/a.png", Some("ollama"));
-        assert_eq!(
-            keys,
-            vec![
-                "provider.ollama".to_string(),
-                "tool.multimodal".to_string(),
-                "tool.http_request".to_string(),
-            ]
+            error
+                .to_string()
+                .contains("multimodal image size limit exceeded")
         );
     }
 
@@ -851,5 +826,29 @@ mod tests {
         let payload = extract_ollama_image_payload("data:image/png;base64,abcd==")
             .expect("payload should be extracted");
         assert_eq!(payload, "abcd==");
+    }
+
+    /// Stripping `[IMAGE:]` markers from history messages leaves only the text
+    /// portion, which is the behaviour needed for non-vision providers (#3674).
+    #[test]
+    fn parse_image_markers_strips_markers_leaving_caption() {
+        let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert_eq!(cleaned, "Describe this screenshot");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], "/tmp/photo.jpg");
+    }
+
+    /// An image-only message (no caption) should produce an empty string after
+    /// marker stripping, so callers can drop it from history.
+    #[test]
+    fn parse_image_markers_image_only_message_becomes_empty() {
+        let input = "[IMAGE:/tmp/photo.jpg]";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert!(
+            cleaned.is_empty(),
+            "expected empty string, got: {cleaned:?}"
+        );
+        assert_eq!(refs.len(), 1);
     }
 }

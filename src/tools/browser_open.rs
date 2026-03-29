@@ -144,7 +144,7 @@ impl Tool for BrowserOpenTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
-                })
+                });
             }
         };
 

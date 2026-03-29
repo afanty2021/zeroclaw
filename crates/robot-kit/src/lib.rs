@@ -116,7 +116,7 @@ pub use sense::SenseTool;
 pub use speak::SpeakTool;
 
 #[cfg(feature = "safety")]
-pub use safety::{preflight_check, SafeDrive, SafetyEvent, SafetyMonitor, SensorReading};
+pub use safety::{SafeDrive, SafetyEvent, SafetyMonitor, SensorReading, preflight_check};
 
 /// Crate version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
